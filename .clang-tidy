@@ -1,0 +1,37 @@
+---
+# Clang-Tidy configuration for MuPDF worker
+Checks: >
+  *,
+  -readability-magic-numbers,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -llvmlibc-*,
+  -altera-*,
+  -fuchsia-*,
+  -android-*,
+  -linuxkernel-*,
+  -darwin-*,
+  -zircon-*,
+  -objc-*,
+  -google-readability-todo,
+  -hicpp-signed-bitwise,
+  -readability-function-cognitive-complexity,
+  -misc-no-recursion
+
+CheckOptions:
+  - key: readability-identifier-naming.VariableCase
+    value: snake_case
+  - key: readability-identifier-naming.FunctionCase
+    value: snake_case
+  - key: readability-identifier-naming.ConstantCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.MacroCase
+    value: UPPER_CASE
+  - key: cppcoreguidelines-avoid-magic-numbers.IgnoredIntegerValues
+    value: '0;1;2;3;4;8;16;32;64;128;255;256;512;1024'
+  - key: readability-function-size.LineThreshold
+    value: 150
+  - key: readability-function-size.StatementThreshold
+    value: 100
+
+HeaderFilterRegex: '.*'
+FormatStyle: file

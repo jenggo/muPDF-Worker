@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  mupdf-parser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mupdf-parser:static
+    container_name: mupdf-parser-service
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount document directory for parsing
+      - ../:/documents:ro
+      # Optional: mount logs directory
+      - ./logs:/app/logs
+    environment:
+      - PORT=8080
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - mupdf-network
+
+  # Ultra-minimal static build using chainguard/static
+  mupdf-parser-minimal:
+    build:
+      context: .
+      dockerfile: Dockerfile.static
+    image: mupdf-parser:minimal
+    container_name: mupdf-parser-minimal
+    ports:
+      - "8081:8080"
+    volumes:
+      - ../:/documents:ro
+    environment:
+      - PORT=8080
+    restart: unless-stopped
+    networks:
+      - mupdf-network
+    profiles:
+      - minimal
+
+  # Test container for development
+  mupdf-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mupdf-parser:static
+    container_name: mupdf-parser-test
+    volumes:
+      - ../:/documents:ro
+    command: ["/test_simple", "/documents/eos.pdf"]
+    depends_on:
+      - mupdf-parser
+    networks:
+      - mupdf-network
+    profiles:
+      - test
+
+networks:
+  mupdf-network:
+    driver: bridge
+
+volumes:
+  logs:
+    driver: local
