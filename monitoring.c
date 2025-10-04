@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdarg.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -18,6 +19,9 @@
 // Global instances
 worker_metrics_t *g_metrics = NULL;
 worker_health_t *g_health = NULL;
+
+// Global log level (default: INFO)
+static log_level_t g_current_log_level = LOG_INFO;
 
 // Internal utility functions
 static uint64_t get_current_time_ms(void);
@@ -345,6 +349,9 @@ double health_calculate_success_rate(void) {
 void log_message(log_level_t level, const char *component, const char *format, ...) {
     if (!component || !format) return;
 
+    // Filter by log level
+    if (level < g_current_log_level) return;
+
     // Get timestamp
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -389,6 +396,31 @@ void log_job_error(const char *job_id, const char *error) {
 
 void log_redis_event(const char *event, const char *details) {
     log_message(LOG_INFO, "REDIS", "%s: %s", event, details);
+}
+
+/*
+ * Set current log level
+ */
+void set_log_level(log_level_t level) {
+    g_current_log_level = level;
+    log_message(LOG_INFO, "LOG", "Log level set to %s", log_level_to_string(level));
+}
+
+/*
+ * Parse log level from string (case-insensitive)
+ * Returns LOG_INFO if string is invalid
+ */
+log_level_t parse_log_level(const char *level_str) {
+    if (!level_str) return LOG_INFO;
+
+    if (strcasecmp(level_str, "debug") == 0) return LOG_DEBUG;
+    if (strcasecmp(level_str, "info") == 0) return LOG_INFO;
+    if (strcasecmp(level_str, "warn") == 0 || strcasecmp(level_str, "warning") == 0) return LOG_WARN;
+    if (strcasecmp(level_str, "error") == 0) return LOG_ERROR;
+    if (strcasecmp(level_str, "fatal") == 0) return LOG_FATAL;
+
+    fprintf(stderr, "[LOG] Unknown log level '%s', defaulting to INFO\n", level_str);
+    return LOG_INFO;
 }
 
 /*

@@ -106,6 +106,10 @@ void log_job_complete(const char *job_id, uint64_t processing_time_ms);
 void log_job_error(const char *job_id, const char *error);
 void log_redis_event(const char *event, const char *details);
 
+// Log level configuration
+void set_log_level(log_level_t level);
+log_level_t parse_log_level(const char *level_str);
+
 // Convenience logging macros
 #define LOG_DEBUG_MSG(comp, fmt, ...) log_message(LOG_DEBUG, comp, fmt, ##__VA_ARGS__)
 #define LOG_INFO_MSG(comp, fmt, ...)  log_message(LOG_INFO, comp, fmt, ##__VA_ARGS__)

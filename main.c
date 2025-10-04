@@ -81,15 +81,15 @@ static void init_worker_config(void) {
         worker_config.callback_timeout = 30; // Default 30 seconds
     }
 
-    // Initialize vector extraction setting
+    // Initialize vector extraction setting (enabled by default for enhanced object detection)
     const char *vector_enabled = getenv("RAG_VECTOR_EXTRACTION_ENABLED");
-    worker_config.vector_extraction_enabled = (vector_enabled && strcmp(vector_enabled, "true") == 0) ? 1 : 0;
+    worker_config.vector_extraction_enabled = (vector_enabled && strcmp(vector_enabled, "false") == 0) ? 0 : 1;
 
     // Log configuration for debugging
     LOG_INFO_MSG("INIT", "Worker configuration loaded:");
     LOG_INFO_MSG("INIT", "  uploads_path: %s", worker_config.uploads_path);
     LOG_INFO_MSG("INIT", "  callback_timeout: %ld", worker_config.callback_timeout);
-    LOG_INFO_MSG("INIT", "  vector_extraction_enabled: %s", worker_config.vector_extraction_enabled ? "true" : "false");
+    LOG_INFO_MSG("INIT", "  vector_extraction_enabled: %s (enhanced object detection)", worker_config.vector_extraction_enabled ? "true" : "false");
 }
 
 // Thread-safe getter functions
@@ -230,6 +230,22 @@ static int write_result_to_file(const char *job_id, const char *json_data, const
 static void send_callback_with_file(const char *callback_url, const char *job_id, parse_result_t *result, const char *image_directory_path);
 
 int main(int argc __attribute__((unused)), char **argv __attribute__((unused))) {
+    // Initialize monitoring system FIRST
+    if (monitoring_init() != 0) {
+        (void)fprintf(stderr, "Failed to initialize monitoring system\n");
+        return 1;
+    }
+
+    // Configure log level from environment BEFORE any logging (supports: debug, info, warn, error, fatal)
+    const char *log_level_env = getenv("WORKER_LOG_LEVEL");
+    if (!log_level_env) {
+        log_level_env = getenv("LOG_LEVEL");  // Fallback to generic LOG_LEVEL
+    }
+    if (log_level_env) {
+        log_level_t level = parse_log_level(log_level_env);
+        set_log_level(level);
+    }
+
     LOG_INFO_MSG("MAIN", "Starting MuPDF Document Parsing Service on port %s", PORT);
 
     // Initialize worker configuration from environment variables
@@ -241,12 +257,6 @@ int main(int argc __attribute__((unused)), char **argv __attribute__((unused))) 
     // Setup signal handlers for graceful shutdown
     (void)signal(SIGINT, signal_handler);
     (void)signal(SIGTERM, signal_handler);
-
-    // Initialize monitoring system
-    if (monitoring_init() != 0) {
-        (void)fprintf(stderr, "Failed to initialize monitoring system\n");
-        return 1;
-    }
 
     // Initialize MuPDF
     base_ctx = fz_new_context(NULL, NULL, FZ_STORE_DEFAULT);
@@ -406,9 +416,9 @@ static int parse_request_handler(struct mg_connection *conn, void *cbdata __attr
     // Extract string values
     const char *image_directory_path = json_object_get_string(image_directory_path_obj);
 
-    // Extract optional vector extraction flag
+    // Extract optional vector extraction flag (enhanced object detection enabled by default)
     json_object *vector_extraction_obj = NULL;
-    int extract_vector_images = get_vector_extraction_enabled_safe(); // Use environment default
+    int extract_vector_images = get_vector_extraction_enabled_safe(); // Use environment default (true)
     if (json_object_object_get_ex(json, "extract_vector_images", &vector_extraction_obj)) {
         extract_vector_images = json_object_get_boolean(vector_extraction_obj);
     }
@@ -815,16 +825,39 @@ static int init_redis_consumer(void) {
     // Set job processor callback
     g_job_processor = redis_job_processor;
 
-    // Start consumer
-    if (redis_consumer_start(redis_consumer) != 0) {
-        fprintf(stderr, "[Redis] Failed to start consumer\n");
-        redis_consumer_destroy(redis_consumer);
-        redis_consumer = NULL;
-        return -1;
+    // Retry Redis connection with exponential backoff
+    // This handles cases where Redis starts slower than the worker (common in Docker)
+    const int max_retries = 60; // Try for up to ~5 minutes
+    int retry_delay = 1; // Start with 1 second
+    const int max_retry_delay = 30; // Cap at 30 seconds
+
+    for (int attempt = 1; attempt <= max_retries; attempt++) {
+        LOG_INFO_MSG("REDIS", "Attempting to connect to Redis (attempt %d/%d)", attempt, max_retries);
+
+        // Start consumer (includes connection attempt)
+        if (redis_consumer_start(redis_consumer) == 0) {
+            LOG_INFO_MSG("REDIS", "Consumer started successfully after %d attempt(s)", attempt);
+            return 0;
+        }
+
+        // Connection failed
+        if (attempt < max_retries) {
+            LOG_WARN_MSG("REDIS", "Connection failed, retrying in %d seconds...", retry_delay);
+            sleep(retry_delay);
+
+            // Exponential backoff with cap
+            retry_delay *= 2;
+            if (retry_delay > max_retry_delay) {
+                retry_delay = max_retry_delay;
+            }
+        }
     }
 
-    printf("[Redis] Consumer started successfully\n");
-    return 0;
+    // All retries exhausted
+    LOG_ERROR_MSG("REDIS", "Failed to connect after %d attempts, falling back to HTTP-only mode", max_retries);
+    redis_consumer_destroy(redis_consumer);
+    redis_consumer = NULL;
+    return -1;
 }
 
 /*
