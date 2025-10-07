@@ -1,6 +1,3 @@
-# Optimized MuPDF Worker - Fast incremental builds with BuildKit caching
-# Usage: DOCKER_BUILDKIT=1 docker build -f Dockerfile.optimized -t worker .
-
 # Stage 1: Build all static libraries from source (CACHED LAYER)
 FROM alpine:latest AS static-builder
 
@@ -154,7 +151,6 @@ RUN --mount=type=cache,target=/src/downloads \
     cp build/release/libmupdf-third.a /usr/local/lib/ && \
     cp -r include/* /usr/local/include/
 
-# Stage 2: Build worker with truly static linking (FAST INCREMENTAL BUILDS)
 FROM alpine:latest AS worker-builder
 
 RUN apk add --no-cache \
@@ -174,62 +170,3 @@ WORKDIR /build
 COPY --from=static-builder /usr/local/lib/ /usr/local/lib/
 COPY --from=static-builder /usr/local/include/ /usr/local/include/
 
-# Copy ONLY header files first (these change less frequently)
-COPY *.h ./
-
-# Copy source files (these change frequently - put LAST)
-COPY *.c ./
-
-# Build static worker binary with cache mount for object files
-RUN --mount=type=cache,target=/build/cache \
-    mkdir -p build && \
-    # Compile object files
-    gcc -std=c99 -Wall -Wextra -DSTATIC_BUILD -Os -DNO_OPENJPEG \
-    -I/usr/local/include -I/usr/local/include/mupdf -I/usr/local/include/json-c \
-    -DCURL_STATICLIB -I/usr/local/include/hiredis \
-    -D_FILE_OFFSET_BITS=64 -DNO_SSL -DUSE_IPV6 -DNDEBUG \
-    -c main.c -o build/main.o && \
-    gcc -std=c99 -Wall -Wextra -DSTATIC_BUILD -Os -DNO_OPENJPEG \
-    -I/usr/local/include -I/usr/local/include/mupdf -I/usr/local/include/json-c \
-    -DCURL_STATICLIB -I/usr/local/include/hiredis \
-    -D_FILE_OFFSET_BITS=64 -DNO_SSL -DUSE_IPV6 -DNDEBUG \
-    -c extraction.c -o build/extraction.o && \
-    gcc -std=c99 -Wall -Wextra -DSTATIC_BUILD -Os -DNO_OPENJPEG \
-    -I/usr/local/include -I/usr/local/include/mupdf -I/usr/local/include/json-c \
-    -DCURL_STATICLIB -I/usr/local/include/hiredis \
-    -D_FILE_OFFSET_BITS=64 -DNO_SSL -DUSE_IPV6 -DNDEBUG \
-    -c redis_queue.c -o build/redis_queue.o && \
-    gcc -std=c99 -Wall -Wextra -DSTATIC_BUILD -Os -DNO_OPENJPEG \
-    -I/usr/local/include -I/usr/local/include/mupdf -I/usr/local/include/json-c \
-    -DCURL_STATICLIB -I/usr/local/include/hiredis \
-    -D_FILE_OFFSET_BITS=64 -DNO_SSL -DUSE_IPV6 -DNDEBUG \
-    -c monitoring.c -o build/monitoring.o && \
-    gcc -std=c99 -Wall -Wextra -DSTATIC_BUILD -Os -DNO_OPENJPEG \
-    -I/usr/local/include -I/usr/local/include/mupdf -I/usr/local/include/json-c \
-    -DCURL_STATICLIB -I/usr/local/include/hiredis -I/usr/local/include/wslay \
-    -D_FILE_OFFSET_BITS=64 -DNO_SSL -DUSE_IPV6 -DNDEBUG \
-    -c ws_client.c -o build/ws_client.o && \
-    # Link static binary
-    gcc -static -s -L/usr/local/lib build/main.o build/extraction.o build/redis_queue.o build/monitoring.o build/ws_client.o \
-    /usr/local/lib/libmupdf.a /usr/local/lib/libmupdf-third.a /usr/local/lib/libjson-c.a /usr/local/lib/libhiredis.a /usr/local/lib/libcurl.a /usr/local/lib/libnghttp2.a /usr/local/lib/libwslay.a \
-    -lz -ljpeg -lpng -lfreetype -lharfbuzz -lpthread -lm -ldl \
-    -o mupdf-parser
-
-# Verify static binary
-RUN file ./mupdf-parser && \
-    echo "Checking dynamic dependencies:" && \
-    (ldd ./mupdf-parser 2>&1 | grep -q "not a dynamic executable" && echo "SUCCESS: Truly static!" || echo "Dependencies found:") && \
-    ldd ./mupdf-parser 2>&1 || true && \
-    ls -lh ./mupdf-parser
-
-# Stage 3: Chainguard static - minimal runtime with security
-FROM cgr.dev/chainguard/static:latest
-
-# Copy the CVE-free binary from build stage
-COPY --from=worker-builder /build/mupdf-parser /mupdf-parser
-
-# Expose HTTP port
-EXPOSE 8080
-
-# Run the CVE-free service
-ENTRYPOINT ["/mupdf-parser"]

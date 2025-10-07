@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+
+# Build mupdf-libs base image if it doesn't exist
+if ! docker images | grep -q mupdf-libs; then
+    echo "Building mupdf-libs base image..."
+    docker build . -f Dockerfile.libs -t mupdf-libs
+fi
+
+# Build worker with local development Dockerfile
+echo "Building worker image..."
+docker build . -f Dockerfile.local -t ghcr.io/jenggo/mupdf-worker:develop
+
+echo "✅ Build complete! Image: ghcr.io/jenggo/mupdf-worker:develop"
+

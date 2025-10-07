@@ -11,9 +11,103 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <sys/time.h>
 
 // Global job processor callback
 job_processor_callback_t g_job_processor = NULL;
+
+/*
+ * TCP connectivity check - faster than full Redis connection
+ * Returns 0 if port is reachable, -1 if not
+ */
+static int tcp_ping(const char *host, int port, int timeout_ms) {
+    int sockfd = -1;
+    struct addrinfo hints, *result_addr = NULL, *rp = NULL;
+    struct timeval tv;
+    int result = -1;
+    char port_str[16];
+
+    // Convert port to string for getaddrinfo
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    // Setup hints for getaddrinfo (modern replacement for gethostbyname)
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;        // IPv4
+    hints.ai_socktype = SOCK_STREAM;  // TCP
+
+    // Resolve hostname (POSIX-compliant, no deprecated functions)
+    if (getaddrinfo(host, port_str, &hints, &result_addr) != 0) {
+        fprintf(stderr, "[Redis TCP] Failed to resolve host: %s\n", host);
+        return -1;
+    }
+
+    // Try each address until we successfully connect
+    for (rp = result_addr; rp != NULL; rp = rp->ai_next) {
+        sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sockfd < 0) {
+            continue; // Try next address
+        }
+
+        // Set socket to non-blocking for timeout control
+        int flags = fcntl(sockfd, F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+        }
+
+        // Set socket timeout
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+
+        // Attempt connection
+        int conn_result = connect(sockfd, rp->ai_addr, rp->ai_addrlen);
+
+        if (conn_result < 0) {
+            if (errno == EINPROGRESS) {
+                // Connection in progress, wait for completion
+                fd_set fdset;
+                FD_ZERO(&fdset);
+                FD_SET(sockfd, &fdset);
+
+                if (select(sockfd + 1, NULL, &fdset, NULL, &tv) > 0) {
+                    int so_error;
+                    socklen_t len = sizeof(so_error);
+                    getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &len);
+
+                    if (so_error == 0) {
+                        result = 0; // Connection successful
+                        break;
+                    }
+                }
+            }
+            close(sockfd);
+            sockfd = -1;
+        } else {
+            result = 0; // Connected immediately
+            break;
+        }
+    }
+
+    if (result_addr) {
+        freeaddrinfo(result_addr);
+    }
+
+    if (sockfd >= 0) {
+        close(sockfd);
+    }
+
+    if (result != 0) {
+        fprintf(stderr, "[Redis TCP] Failed to connect to %s:%d\n", host, port);
+    }
+
+    return result;
+}
 
 /*
  * Create a new Redis consumer instance
@@ -134,7 +228,19 @@ void redis_consumer_destroy(redis_consumer_t *consumer) {
 int redis_connect(redis_consumer_t *consumer) {
     if (!consumer) return -1;
 
-    // Create connection with timeout
+    // Step 1: TCP connectivity check (fast pre-flight check)
+    printf("[Redis] Checking TCP connectivity to %s:%d...\n",
+           consumer->config.host, consumer->config.port);
+
+    if (tcp_ping(consumer->config.host, consumer->config.port, 2000) != 0) {
+        fprintf(stderr, "[Redis] TCP connectivity check failed: %s:%d unreachable\n",
+                consumer->config.host, consumer->config.port);
+        return -1;
+    }
+
+    printf("[Redis] TCP connectivity OK, establishing Redis connection...\n");
+
+    // Step 2: Create Redis protocol connection with timeout
     struct timeval timeout = {
         .tv_sec = consumer->config.timeout_ms / 1000,
         .tv_usec = (consumer->config.timeout_ms % 1000) * 1000
@@ -179,7 +285,18 @@ int redis_connect(redis_consumer_t *consumer) {
         freeReplyObject(reply);
     }
 
-    printf("[Redis] Connected successfully to %s:%d (db=%d)\n",
+    // Step 3: Verify Redis is responding
+    redisReply *ping_reply = redisCommand(consumer->ctx, "PING");
+    if (!ping_reply || ping_reply->type == REDIS_REPLY_ERROR) {
+        fprintf(stderr, "[Redis] PING verification failed after connection\n");
+        if (ping_reply) freeReplyObject(ping_reply);
+        redisFree(consumer->ctx);
+        consumer->ctx = NULL;
+        return -1;
+    }
+    freeReplyObject(ping_reply);
+
+    printf("[Redis] ✓ Connected successfully to %s:%d (db=%d)\n",
            consumer->config.host, consumer->config.port, consumer->config.db);
 
     return 0;
@@ -225,27 +342,25 @@ void* redis_consumer_thread(void *arg) {
     // Main processing loop with exponential backoff
     int consecutive_failures = 0;
     int max_backoff = 60; // Maximum backoff in seconds
-    
+
     while (consumer->running) {
         if (redis_process_jobs(consumer) != 0) {
             consecutive_failures++;
-            
-            // Calculate exponential backoff (1, 2, 4, 8, 16, 32, 60, 60...)
-            int backoff = 1 << (consecutive_failures - 1);
-            if (backoff > max_backoff) backoff = max_backoff;
-            
-            printf("[Redis] Job processing failed (attempt %d), retrying in %d seconds...\n", 
-                   consecutive_failures, backoff);
-            sleep(backoff);
 
-            // Check connection health and reconnect if needed
+            // Check connection health immediately when job processing fails
             int need_reconnect = 0;
             if (!consumer->ctx || consumer->ctx->err) {
+                printf("[Redis] Connection error detected: %s\n",
+                       consumer->ctx ? consumer->ctx->errstr : "context is NULL");
                 need_reconnect = 1;
             } else {
                 // Test connection with PING
                 redisReply *ping_reply = redisCommand(consumer->ctx, "PING");
-                if (!ping_reply || ping_reply->type == REDIS_REPLY_ERROR) {
+                if (!ping_reply) {
+                    printf("[Redis] PING command failed - connection lost\n");
+                    need_reconnect = 1;
+                } else if (ping_reply->type == REDIS_REPLY_ERROR) {
+                    printf("[Redis] PING returned error: %s\n", ping_reply->str);
                     need_reconnect = 1;
                 }
                 if (ping_reply) freeReplyObject(ping_reply);
@@ -254,31 +369,50 @@ void* redis_consumer_thread(void *arg) {
             if (need_reconnect) {
                 printf("[Redis] Connection lost, attempting to reconnect...\n");
                 redis_disconnect(consumer);
-                
-                // Try to reconnect with exponential backoff
+
+                // Keep trying to reconnect indefinitely (with exponential backoff)
                 int reconnect_attempts = 0;
-                int max_reconnect_attempts = 5;
-                
-                while (reconnect_attempts < max_reconnect_attempts && consumer->running) {
+
+                while (consumer->running) {
+                    reconnect_attempts++;
+
                     if (redis_connect(consumer) == 0) {
-                        printf("[Redis] Reconnection successful after %d attempts\n", reconnect_attempts + 1);
+                        printf("[Redis] Reconnection successful after %d attempt(s)\n", reconnect_attempts);
                         consecutive_failures = 0; // Reset failure counter on successful reconnect
+
+                        // Recreate consumer group after reconnection
+                        char stream_key[512];
+                        snprintf(stream_key, sizeof(stream_key), "%s%s", REDIS_QUEUE_PREFIX, consumer->queue_name);
+                        redisReply *group_reply = redisCommand(consumer->ctx,
+                            "XGROUP CREATE %s %s 0 MKSTREAM",
+                            stream_key, consumer->consumer_group);
+                        if (group_reply) {
+                            if (group_reply->type != REDIS_REPLY_ERROR ||
+                                strstr(group_reply->str, "BUSYGROUP") != NULL) {
+                                printf("[Redis] Consumer group ready after reconnection: %s\n", consumer->consumer_group);
+                            }
+                            freeReplyObject(group_reply);
+                        }
                         break;
                     }
-                    
-                    reconnect_attempts++;
-                    int reconnect_backoff = 1 << reconnect_attempts;
+
+                    // Calculate exponential backoff with cap
+                    int reconnect_backoff = 1 << (reconnect_attempts < 6 ? reconnect_attempts : 6);
                     if (reconnect_backoff > max_backoff) reconnect_backoff = max_backoff;
-                    
-                    printf("[Redis] Reconnection attempt %d failed, retrying in %d seconds...\n", 
+
+                    printf("[Redis] Reconnection attempt %d failed, retrying in %d seconds...\n",
                            reconnect_attempts, reconnect_backoff);
                     sleep(reconnect_backoff);
                 }
-                
-                if (reconnect_attempts >= max_reconnect_attempts) {
-                    printf("[Redis] Failed to reconnect after %d attempts, continuing to retry...\n", 
-                           max_reconnect_attempts);
-                }
+            } else {
+                // Not a connection error, just a processing error
+                // Calculate exponential backoff (1, 2, 4, 8, 16, 32, 60, 60...)
+                int backoff = 1 << (consecutive_failures - 1);
+                if (backoff > max_backoff) backoff = max_backoff;
+
+                printf("[Redis] Job processing failed (attempt %d), retrying in %d seconds...\n",
+                       consecutive_failures, backoff);
+                sleep(backoff);
             }
         } else {
             // Reset failure counter on successful processing
@@ -319,11 +453,8 @@ int redis_process_jobs(redis_consumer_t *consumer) {
     if (reply->type == REDIS_REPLY_ERROR) {
         fprintf(stderr, "[Redis] XREADGROUP error: %s\n", reply->str);
         freeReplyObject(reply);
-        
-        // Check if error indicates connection issues
-        if (strstr(reply->str, "connection") || strstr(reply->str, "timeout")) {
-            return -1;
-        }
+
+        // Return error to trigger reconnection logic
         return -1;
     }
 
@@ -385,6 +516,9 @@ int redis_parse_job_message(redisReply *reply, redis_job_t *job) {
 
         if (strcmp(field, "job_id") == 0) {
             strncpy(job->job_id, value, sizeof(job->job_id) - 1);
+        } else if (strcmp(field, "document_id") == 0) {
+            strncpy(job->document_id, value, sizeof(job->document_id) - 1);
+            job->document_id[sizeof(job->document_id) - 1] = '\0';
         } else if (strcmp(field, "file_path") == 0) {
             strncpy(job->file_path, value, sizeof(job->file_path) - 1);
         } else if (strcmp(field, "callback_url") == 0) {

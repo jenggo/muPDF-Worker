@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+*.o
+*.a
+mupdf-parser
+
+# Git and version control
+.git/
+.gitignore
+
+# Documentation and configs
+README.md
+*.md
+.clang-tidy
+
+# Temporary files
+*.tmp
+*.log

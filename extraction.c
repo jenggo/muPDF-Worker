@@ -18,6 +18,15 @@
 extern void get_org_images_path(char *buffer, size_t buffer_size, const char *image_directory_path);
 
 // Internal function declarations
+// Image resize result structure
+typedef struct {
+    fz_buffer *buffer;      // PNG buffer (NULL if resize failed)
+    int width;              // Final width after resize
+    int height;             // Final height after resize
+    size_t size_bytes;      // Final PNG size in bytes
+    int ocr_compatible;     // 1 if under size limit, 0 if too large
+} resize_result_t;
+
 // Object-level vector extraction structures
 typedef struct {
     fz_rect bbox;           // Bounding box of the graphic object
@@ -49,6 +58,7 @@ static json_object* create_bounding_box_json(fz_rect bbox);
 static json_object* create_quad_json(fz_quad quad);
 static int is_paragraph_break(fz_stext_line *current_line, fz_stext_line *next_line);
 static int is_meaningful_image(fz_context *ctx, fz_image *image, fz_rect bbox, int no_filter);
+static resize_result_t resize_image_to_limit(fz_context *ctx, fz_pixmap *original_pix, size_t max_bytes);
 
 /*
  * Extract text blocks with character-level coordinates
@@ -462,33 +472,50 @@ static json_object* extract_images_from_page_filtered(fz_context *ctx, fz_page *
                 char image_path[512] = {0};
 
                 fz_try(ctx) {
-                    fz_buffer *buffer = fz_new_buffer_from_image_as_png(ctx, img, fz_default_color_params);
-                    if (buffer) {
-                        unsigned char *data = NULL;
-                        size_t len = fz_buffer_storage(ctx, buffer, &data);
+                    // Convert image to pixmap for resizing support
+                    fz_pixmap *pix = fz_get_pixmap_from_image(ctx, img, NULL, NULL, NULL, NULL);
+                    if (pix) {
+                        // Resize if needed to stay under 20MB (for OCR compatibility)
+                        resize_result_t resize_result = resize_image_to_limit(ctx, pix, 20 * 1024 * 1024);
 
-                        // Create organizational directory if it doesn't exist
-                        char org_dir[256];
-                        get_org_images_path(org_dir, sizeof(org_dir), image_directory_path);
+                        if (resize_result.buffer && resize_result.ocr_compatible) {
+                            // Image successfully resized and is OCR-compatible
+                            unsigned char *data = NULL;
+                            size_t len = fz_buffer_storage(ctx, resize_result.buffer, &data);
 
-                        // Generate organizational filename: org_id/documentID_page_imageId_timestamp.png
-                        // Note: We don't have documentID in this context, so we'll use a simple pattern for now
-                        (void)snprintf(image_path, sizeof(image_path),
-                                "%s/page_%d_img_%d_%ld.png",
-                                org_dir, page_num, image_id, (long)time(NULL));
+                            // Create organizational directory if it doesn't exist
+                            char org_dir[256];
+                            get_org_images_path(org_dir, sizeof(org_dir), image_directory_path);
 
-                        // Save image data to file
-                        FILE *img_file = fopen(image_path, "wb");
-                        if (img_file) {
-                            (void)fwrite(data, 1, len, img_file);
-                            (void)fclose(img_file);
-                            printf("[IMAGE_DEBUG] Saved image to: %s (%zu bytes)\n", image_path, len);
+                            // Generate organizational filename: org_id/documentID_page_imageId_timestamp.png
+                            (void)snprintf(image_path, sizeof(image_path),
+                                    "%s/page_%d_img_%d_%ld.png",
+                                    org_dir, page_num, image_id, (long)time(NULL));
+
+                            // Save image data to file
+                            FILE *img_file = fopen(image_path, "wb");
+                            if (img_file) {
+                                (void)fwrite(data, 1, len, img_file);
+                                (void)fclose(img_file);
+                                printf("[IMAGE_DEBUG] Saved OCR-compatible image: %s (%zu bytes, %dx%d)\n",
+                                       image_path, len, resize_result.width, resize_result.height);
+
+                                // Add OCR compatibility flag to JSON
+                                json_object_object_add(image_obj, "ocr_compatible", json_object_new_boolean(1));
+                            } else {
+                                printf("[IMAGE_DEBUG] Failed to save image: %s\n", image_path);
+                                image_path[0] = '\0'; // Clear path on failure
+                            }
+
+                            fz_drop_buffer(ctx, resize_result.buffer);
                         } else {
-                            printf("[IMAGE_DEBUG] Failed to save image: %s\n", image_path);
-                            image_path[0] = '\0'; // Clear path on failure
+                            // Image exceeds OCR limit - skip OCR but still record metadata
+                            printf("[IMAGE_DEBUG] Skipping OCR for oversized image (page %d, img %d): %dx%d\n",
+                                   page_num, image_id, img->w, img->h);
+                            json_object_object_add(image_obj, "ocr_compatible", json_object_new_boolean(0));
+                            json_object_object_add(image_obj, "skip_reason", json_object_new_string("exceeds_20mb_limit"));
                         }
-
-                        fz_drop_buffer(ctx, buffer);
+                        fz_drop_pixmap(ctx, pix);
                     }
                 }
                 fz_catch(ctx) {
@@ -620,6 +647,124 @@ static int is_meaningful_image(fz_context *ctx, fz_image *image, fz_rect bbox, i
     }
 
     return is_meaningful;
+}
+
+/*
+ * Resize image to fit within maximum byte size limit
+ * Iteratively scales down the image until PNG encoding is under max_bytes
+ * Returns resize result with buffer, dimensions, and OCR compatibility flag
+ * If image cannot fit under limit after 10 iterations, returns NULL buffer with ocr_compatible=0
+ */
+static resize_result_t resize_image_to_limit(fz_context *ctx, fz_pixmap *original_pix, size_t max_bytes) {
+    resize_result_t result = {NULL, original_pix->w, original_pix->h, 0, 0};
+    fz_buffer *buffer = NULL;
+    fz_pixmap *scaled_pix = NULL;
+    float scale_factor = 1.0f;
+    const float scale_step = 0.8f; // Reduce by 20% each iteration
+    const size_t MAX_SIZE = max_bytes;
+
+    fz_var(buffer);
+    fz_var(scaled_pix);
+
+    fz_try(ctx) {
+        // Try encoding at original size first
+        buffer = fz_new_buffer_from_pixmap_as_png(ctx, original_pix, fz_default_color_params);
+        unsigned char *data = NULL;
+        size_t len = fz_buffer_storage(ctx, buffer, &data);
+
+        printf("[IMAGE_RESIZE] Original size: %dx%d, PNG size: %zu bytes (limit: %zu bytes)\n",
+               original_pix->w, original_pix->h, len, MAX_SIZE);
+
+        // If under limit, use as-is
+        if (len <= MAX_SIZE) {
+            printf("[IMAGE_RESIZE] Image within size limit, no resize needed\n");
+            result.buffer = buffer;
+            result.size_bytes = len;
+            result.ocr_compatible = 1;
+            buffer = NULL;  // Prevent cleanup in always block
+        } else {
+            // Image too large, need to resize
+            printf("[IMAGE_RESIZE] Image exceeds limit, starting resize loop\n");
+            fz_drop_buffer(ctx, buffer);
+            buffer = NULL;
+
+            scaled_pix = fz_keep_pixmap(ctx, original_pix);
+
+            // Iteratively scale down until under limit (max 10 iterations)
+            for (int iteration = 0; iteration < 10; iteration++) {
+                scale_factor *= scale_step;
+                int new_width = (int)(original_pix->w * scale_factor);
+                int new_height = (int)(original_pix->h * scale_factor);
+
+                // Don't scale below 100x100
+                if (new_width < 100 || new_height < 100) {
+                    printf("[IMAGE_RESIZE] Reached minimum size limit (100x100), stopping resize\n");
+                    break;
+                }
+
+                // Create scaled pixmap
+                fz_pixmap *temp_pix = fz_scale_pixmap(ctx, scaled_pix,
+                                                      0, 0,  // x, y position
+                                                      new_width, new_height,  // target dimensions
+                                                      NULL);  // no clipping
+                fz_drop_pixmap(ctx, scaled_pix);
+                scaled_pix = temp_pix;
+
+                // Try encoding at this size
+                buffer = fz_new_buffer_from_pixmap_as_png(ctx, scaled_pix, fz_default_color_params);
+                len = fz_buffer_storage(ctx, buffer, &data);
+
+                printf("[IMAGE_RESIZE] Iteration %d: scaled to %dx%d (%.1f%%), PNG size: %zu bytes\n",
+                       iteration + 1, new_width, new_height, scale_factor * 100.0f, len);
+
+                if (len <= MAX_SIZE) {
+                    result.buffer = buffer;
+                    result.width = new_width;
+                    result.height = new_height;
+                    result.size_bytes = len;
+                    result.ocr_compatible = 1;
+                    printf("[IMAGE_RESIZE] Successfully resized to %dx%d, final size: %zu bytes\n",
+                           new_width, new_height, len);
+                    buffer = NULL;  // Prevent cleanup in always block
+                    break;
+                }
+
+                // Still too large, continue scaling
+                fz_drop_buffer(ctx, buffer);
+                buffer = NULL;
+            }
+
+            // If still too large after 10 iterations, mark as OCR-incompatible
+            if (buffer == NULL && result.buffer == NULL) {
+                result.buffer = NULL;
+                result.width = scaled_pix ? scaled_pix->w : original_pix->w;
+                result.height = scaled_pix ? scaled_pix->h : original_pix->h;
+                result.size_bytes = 0;
+                result.ocr_compatible = 0;
+                printf("[IMAGE_RESIZE] WARNING: Could not fit under limit after 10 iterations, marking as OCR-incompatible\n");
+                printf("[IMAGE_RESIZE] Image will be skipped for OCR processing (original size: %dx%d)\n",
+                       original_pix->w, original_pix->h);
+            }
+        }
+    }
+    fz_always(ctx) {
+        // Cleanup temp buffer if not used in result
+        if (buffer) {
+            fz_drop_buffer(ctx, buffer);
+        }
+        // Cleanup scaled pixmap if created
+        if (scaled_pix && scaled_pix != original_pix) {
+            fz_drop_pixmap(ctx, scaled_pix);
+        }
+    }
+    fz_catch(ctx) {
+        printf("[IMAGE_RESIZE] Error during resize operation\n");
+        result.buffer = NULL;
+        result.ocr_compatible = 0;
+        fz_rethrow(ctx);
+    }
+
+    return result;
 }
 
 /*
@@ -781,7 +926,7 @@ static json_object* extract_vector_objects_from_page(fz_context *ctx, fz_page *p
 
             // Render only this object region
             fz_run_page(ctx, page, draw_device, fz_identity, NULL);
-            fz_close_device(ctx, draw_device);
+            fz_close_device(ctx, draw_device);  // ✅ Close inside try block
 
             // Verify the rendered content has meaningful vector graphics
             int pixel_count = pix->w * pix->h;
@@ -802,7 +947,7 @@ static json_object* extract_vector_objects_from_page(fz_context *ctx, fz_page *p
             
             // Only save objects with meaningful content
             if (content_ratio > 0.02f && content_ratio < 0.85f) { // 2-85% content
-                // Save this vector object as an image
+                // Save this vector object as an image with resize support
                 char org_dir[256];
                 get_org_images_path(org_dir, sizeof(org_dir), image_directory_path);
 
@@ -812,43 +957,73 @@ static json_object* extract_vector_objects_from_page(fz_context *ctx, fz_page *p
                         "%s/page_%d_%s_%d_%ld.png",
                         org_dir, page_num, object_type, object_id, (long)time(NULL));
 
-                fz_save_pixmap_as_png(ctx, pix, image_path);
+                // Resize if needed to stay under 20MB (for OCR compatibility)
+                resize_result_t vec_result = resize_image_to_limit(ctx, pix, 20 * 1024 * 1024);
+                int final_width = vec_result.width;
+                int final_height = vec_result.height;
+                int ocr_compatible = vec_result.ocr_compatible;
 
-                // Create JSON object for this vector object
-                json_object *vector_obj = json_object_new_object();
-                json_object_object_add(vector_obj, "page", json_object_new_int(page_num));
-                json_object_object_add(vector_obj, "object_id", json_object_new_int(object_id));
-                json_object_object_add(vector_obj, "type", json_object_new_string("vector_object"));
-                json_object_object_add(vector_obj, "object_type", json_object_new_string(object_type));
-                json_object_object_add(vector_obj, "bbox", create_bounding_box_json(obj->bbox));
-                json_object_object_add(vector_obj, "render_bbox", create_bounding_box_json(render_bbox));
-                json_object_object_add(vector_obj, "width", json_object_new_int(pix->w));
-                json_object_object_add(vector_obj, "height", json_object_new_int(pix->h));
-                json_object_object_add(vector_obj, "image_path", json_object_new_string(image_path));
-                json_object_object_add(vector_obj, "content_ratio", json_object_new_double(content_ratio));
-                json_object_object_add(vector_obj, "text_density_pct", json_object_new_int(text_density));
-                json_object_object_add(vector_obj, "path_count", json_object_new_int(obj->path_count));
-                json_object_object_add(vector_obj, "density", json_object_new_double(obj->density));
-                json_object_object_add(vector_obj, "is_instructional", json_object_new_boolean(obj->is_instructional));
+                if (vec_result.buffer && vec_result.ocr_compatible) {
+                    unsigned char *vec_data = NULL;
+                    size_t vec_len = fz_buffer_storage(ctx, vec_result.buffer, &vec_data);
 
-                json_object_array_add(vector_objects_array, vector_obj);
-                object_id++;
-                (*vector_object_count)++;
+                    FILE *vec_file = fopen(image_path, "wb");
+                    if (vec_file) {
+                        fwrite(vec_data, 1, vec_len, vec_file);
+                        fclose(vec_file);
+                        printf("[VECTOR_OBJ_DEBUG] Saved OCR-compatible vector object: %s (%zu bytes, %dx%d)\n",
+                               image_path, vec_len, final_width, final_height);
+                    }
 
-                printf("[VECTOR_OBJ_DEBUG] Extracted %s object %d: content_ratio=%.3f paths=%d path=%s\n",
-                       object_type, object_id, content_ratio, obj->path_count, image_path);
+                    fz_drop_buffer(ctx, vec_result.buffer);
+                } else {
+                    printf("[VECTOR_OBJ_DEBUG] Skipping OCR for oversized vector object %d (page %d)\n",
+                           i, page_num);
+                    // Still track metadata but mark as OCR-incompatible
+                    image_path[0] = '\0'; // No image saved
+                }
+
+                // Create JSON object for this vector object (only if OCR-compatible or has valid path)
+                if (ocr_compatible || image_path[0] != '\0') {
+                    json_object *vector_obj = json_object_new_object();
+                    json_object_object_add(vector_obj, "page", json_object_new_int(page_num));
+                    json_object_object_add(vector_obj, "object_id", json_object_new_int(object_id));
+                    json_object_object_add(vector_obj, "type", json_object_new_string("vector_object"));
+                    json_object_object_add(vector_obj, "object_type", json_object_new_string(object_type));
+                    json_object_object_add(vector_obj, "bbox", create_bounding_box_json(obj->bbox));
+                    json_object_object_add(vector_obj, "render_bbox", create_bounding_box_json(render_bbox));
+                    json_object_object_add(vector_obj, "width", json_object_new_int(final_width));
+                    json_object_object_add(vector_obj, "height", json_object_new_int(final_height));
+                    json_object_object_add(vector_obj, "ocr_compatible", json_object_new_boolean(ocr_compatible));
+
+                    if (image_path[0] != '\0') {
+                        json_object_object_add(vector_obj, "image_path", json_object_new_string(image_path));
+                    } else {
+                        json_object_object_add(vector_obj, "skip_reason", json_object_new_string("exceeds_20mb_limit"));
+                    }
+
+                    json_object_object_add(vector_obj, "content_ratio", json_object_new_double(content_ratio));
+                    json_object_object_add(vector_obj, "text_density_pct", json_object_new_int(text_density));
+                    json_object_object_add(vector_obj, "path_count", json_object_new_int(obj->path_count));
+                    json_object_object_add(vector_obj, "density", json_object_new_double(obj->density));
+                    json_object_object_add(vector_obj, "is_instructional", json_object_new_boolean(obj->is_instructional));
+
+                    json_object_array_add(vector_objects_array, vector_obj);
+                    object_id++;
+                    (*vector_object_count)++;
+
+                    printf("[VECTOR_OBJ_DEBUG] Extracted %s object %d: content_ratio=%.3f paths=%d path=%s\n",
+                           object_type, object_id, content_ratio, obj->path_count, image_path);
+                }
             } else {
                 printf("[VECTOR_OBJ_DEBUG] Object %d skipped: content_ratio=%.3f (outside meaningful range)\n",
                        i, content_ratio);
             }
         }
         fz_always(ctx) {
-            if (draw_device) {
-                fz_drop_device(ctx, draw_device);
-            }
-            if (pix) {
-                fz_drop_pixmap(ctx, pix);
-            }
+            // ✅ Drop device and pixmap directly in always block (no nested try)
+            fz_drop_device(ctx, draw_device);
+            fz_drop_pixmap(ctx, pix);
         }
         fz_catch(ctx) {
             printf("[VECTOR_OBJ_DEBUG] Failed to render vector object %d\n", i);
@@ -876,6 +1051,9 @@ static vector_object_list_t* analyze_page_vector_objects(fz_context *ctx, fz_pag
     fz_device *list_device = NULL;
     fz_rect page_bounds = fz_bound_page(ctx, page);
 
+    fz_var(list);
+    fz_var(list_device);
+
     fz_try(ctx) {
         // Create display list to capture drawing operations
         list = fz_new_display_list(ctx, page_bounds);
@@ -883,7 +1061,7 @@ static vector_object_list_t* analyze_page_vector_objects(fz_context *ctx, fz_pag
 
         // Run page through list device to capture vector operations
         fz_run_page(ctx, page, list_device, fz_identity, NULL);
-        fz_close_device(ctx, list_device);
+        fz_close_device(ctx, list_device);  // ✅ Close inside try block
 
         // Use adaptive sampling based on page size to detect dense graphic areas
         float page_width = page_bounds.x1 - page_bounds.x0;
@@ -927,25 +1105,26 @@ static vector_object_list_t* analyze_page_vector_objects(fz_context *ctx, fz_pag
 
                     test_device = fz_new_draw_device(ctx, test_transform, test_pix);
                     fz_run_display_list(ctx, list, test_device, fz_identity, sample_region, NULL);
-                    fz_close_device(ctx, test_device);
+                    fz_close_device(ctx, test_device);  // ✅ Close inside try block
 
                     // Calculate density
                     int test_pixels = test_pix->w * test_pix->h;
                     int non_white = 0;
                     unsigned char *test_data = fz_pixmap_samples(ctx, test_pix);
-                    
+
                     for (int p = 0; p < test_pixels; p++) {
                         int offset = p * test_pix->n;
                         if (test_data[offset] != 255 || test_data[offset + 1] != 255 || test_data[offset + 2] != 255) {
                             non_white++;
                         }
                     }
-                    
+
                     density_map[row][col] = (float)non_white / (float)test_pixels;
                 }
                 fz_always(ctx) {
-                    if (test_device) fz_drop_device(ctx, test_device);
-                    if (test_pix) fz_drop_pixmap(ctx, test_pix);
+                    // ✅ Drop device directly in always block (no nested try)
+                    fz_drop_device(ctx, test_device);
+                    fz_drop_pixmap(ctx, test_pix);
                 }
                 fz_catch(ctx) {
                     density_map[row][col] = 0.0f;
@@ -1047,8 +1226,9 @@ static vector_object_list_t* analyze_page_vector_objects(fz_context *ctx, fz_pag
         free(visited);
     }
     fz_always(ctx) {
-        if (list_device) fz_drop_device(ctx, list_device);
-        if (list) fz_drop_display_list(ctx, list);
+        // ✅ Drop device and display list directly in always block (no nested try)
+        fz_drop_device(ctx, list_device);
+        fz_drop_display_list(ctx, list);
     }
     fz_catch(ctx) {
         printf("[VECTOR_OBJ_DEBUG] Failed to analyze vector objects\n");
@@ -1074,48 +1254,43 @@ static int calculate_text_density_in_region(fz_context *ctx, fz_page *page, fz_r
         int char_count = 0;
         float region_area = (region.x1 - region.x0) * (region.y1 - region.y0);
 
-        if (region_area <= 0) {
-            fz_drop_stext_page(ctx, stext);
-            return 0;
-        }
+        // Only process if region has valid area
+        if (region_area > 0) {
+            // Count characters that intersect with the region
+            for (fz_stext_block *block = stext->first_block; block; block = block->next) {
+                if (block->type != FZ_STEXT_BLOCK_TEXT)
+                    continue;
 
-        // Count characters that intersect with the region
-        for (fz_stext_block *block = stext->first_block; block; block = block->next) {
-            if (block->type != FZ_STEXT_BLOCK_TEXT)
-                continue;
+                for (fz_stext_line *line = block->u.t.first_line; line; line = line->next) {
+                    for (fz_stext_char *ch = line->first_char; ch; ch = ch->next) {
+                        fz_rect char_bbox = fz_rect_from_quad(ch->quad);
 
-            for (fz_stext_line *line = block->u.t.first_line; line; line = line->next) {
-                for (fz_stext_char *ch = line->first_char; ch; ch = ch->next) {
-                    fz_rect char_bbox = fz_rect_from_quad(ch->quad);
-
-                    // Check if character intersects with region
-                    fz_rect intersection = fz_intersect_rect(char_bbox, region);
-                    if (!fz_is_empty_rect(intersection)) {
-                        char_count++;
+                        // Check if character intersects with region
+                        fz_rect intersection = fz_intersect_rect(char_bbox, region);
+                        if (!fz_is_empty_rect(intersection)) {
+                            char_count++;
+                        }
                     }
                 }
             }
+
+            // Estimate text coverage
+            // Average character size: 7 pixels wide x 12 pixels high
+            float avg_char_area = 7.0f * 12.0f;
+            float estimated_text_area = char_count * avg_char_area;
+            float text_coverage = estimated_text_area / region_area;
+
+            // Convert to percentage (0-100), cap at 100
+            text_density_pct = (int)(text_coverage * 100.0f);
+            if (text_density_pct > 100) text_density_pct = 100;
         }
-
-        // Estimate text coverage
-        // Average character size: 7 pixels wide x 12 pixels high
-        float avg_char_area = 7.0f * 12.0f;
-        float estimated_text_area = char_count * avg_char_area;
-        float text_coverage = estimated_text_area / region_area;
-
-        // Convert to percentage (0-100), cap at 100
-        text_density_pct = (int)(text_coverage * 100.0f);
-        if (text_density_pct > 100) text_density_pct = 100;
-
     }
     fz_always(ctx) {
-        if (stext) {
-            fz_drop_stext_page(ctx, stext);
-        }
+        fz_drop_stext_page(ctx, stext);
     }
     fz_catch(ctx) {
         printf("[TEXT_DENSITY_DEBUG] Failed to calculate text density\n");
-        return 0;
+        text_density_pct = 0;
     }
 
     return text_density_pct;

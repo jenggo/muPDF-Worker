@@ -25,6 +25,7 @@ typedef struct {
 typedef struct {
     char message_id[64];
     char job_id[256];
+    char document_id[256]; // Document UUID for ticketing system
     char file_path[1024];
     char callback_url[1024];
     char worker_url[1024];

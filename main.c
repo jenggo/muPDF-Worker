@@ -1,16 +1,17 @@
 /*
  * Standalone MuPDF Document Parsing Service
  *
- * A lightweight HTTP service that provides document parsing capabilities
- * using MuPDF. Supports text extraction with spatial coordinates,
- * paragraph-level bounding boxes, and embedded image extraction.
+ * A lightweight WebSocket-based service that provides document parsing capabilities
+ * using MuPDF. Connects to Airag server for bidirectional communication.
  *
  * Features:
- * - HTTP API for document parsing requests
- * - Asynchronous callback responses
- * - Concurrent request handling
- * - Support for PDF and other MuPDF-supported formats
- * - JSON request/response format
+ * - WebSocket connectivity to Airag server
+ * - Real-time job progress reporting
+ * - Instant health detection via connection state
+ * - Text extraction with spatial coordinates
+ * - Paragraph-level bounding boxes and embedded image extraction
+ * - Redis queue integration for async job processing
+ * - JSON message protocol
  */
 
 // Enable GNU extensions for strerror_r and other functions
@@ -20,6 +21,7 @@
 // System includes (alphabetical)
 #include <errno.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,19 +36,40 @@
 #include <mupdf/fitz.h>
 
 // Local includes (alphabetical)
-#include "civetweb/include/civetweb.h"
 #include "monitoring.h"
 #include "redis_queue.h"
+#include "ws_client.h"
 
 #define MAX_WORKERS 8
-#define PORT "8080"
 #define BUFFER_SIZE 4096
+
+// MuPDF thread-safety locks
+// Increased from 4 to 6 to support ICC color profile handling in multi-threaded environment
+// MuPDF requires at least FZ_LOCK_FREETYPE (6) locks for proper thread safety with color management
+#define FZ_LOCK_MAX 6
+static pthread_mutex_t mupdf_locks[FZ_LOCK_MAX];
+
+static void lock_mutex(void *user, int lock) {
+    (void)user;
+    pthread_mutex_lock(&mupdf_locks[lock]);
+}
+
+static void unlock_mutex(void *user, int lock) {
+    (void)user;
+    pthread_mutex_unlock(&mupdf_locks[lock]);
+}
+
+static fz_locks_context mupdf_locks_ctx = {
+    .user = NULL,
+    .lock = lock_mutex,
+    .unlock = unlock_mutex
+};
 
 // Configuration structure for thread-safe environment variable access
 typedef struct {
     char uploads_path[1024];
-    long callback_timeout;
     int vector_extraction_enabled;
+    int max_concurrent_jobs;
 } worker_config_t;
 
 // Redis configuration structure is defined in redis_queue.h
@@ -54,6 +77,15 @@ typedef struct {
 // Global configuration loaded at startup
 static worker_config_t worker_config = {0};
 static redis_config_t redis_config_cached = {0};
+
+// Semaphore for limiting concurrent job processing
+static sem_t job_semaphore;
+
+// WebSocket client for communication with Airag
+static ws_client_t *ws_client = NULL;
+
+// Helper function to send job progress via WebSocket
+static void send_job_progress(const char *job_id, const char *status, int progress_percent, const char *current_step);
 
 // Initialize worker configuration from environment variables (thread-safe)
 static void init_worker_config(void) {
@@ -67,29 +99,29 @@ static void init_worker_config(void) {
         worker_config.uploads_path[sizeof(worker_config.uploads_path) - 1] = '\0';
     }
 
-    // Initialize callback timeout
-    const char *timeout_str = getenv("WORKER_CALLBACK_TIMEOUT");
-    if (timeout_str) {
-        char *endptr = NULL;
-        long timeout = strtol(timeout_str, &endptr, 10);
-        if (*endptr == '\0' && timeout > 0 && timeout <= 300) {
-            worker_config.callback_timeout = timeout;
-        } else {
-            worker_config.callback_timeout = 30; // Default 30 seconds
-        }
-    } else {
-        worker_config.callback_timeout = 30; // Default 30 seconds
-    }
-
     // Initialize vector extraction setting (enabled by default for enhanced object detection)
     const char *vector_enabled = getenv("RAG_VECTOR_EXTRACTION_ENABLED");
     worker_config.vector_extraction_enabled = (vector_enabled && strcmp(vector_enabled, "false") == 0) ? 0 : 1;
 
+    // Initialize max concurrent jobs setting (default: 2 to prevent memory balloning)
+    const char *max_concurrent = getenv("WORKER_MAX_CONCURRENT");
+    if (max_concurrent) {
+        char *endptr = NULL;
+        long max_jobs = strtol(max_concurrent, &endptr, 10);
+        if (*endptr == '\0' && max_jobs > 0 && max_jobs <= 32) {
+            worker_config.max_concurrent_jobs = (int)max_jobs;
+        } else {
+            worker_config.max_concurrent_jobs = 2; // Default 2 concurrent jobs
+        }
+    } else {
+        worker_config.max_concurrent_jobs = 2; // Default 2 concurrent jobs
+    }
+
     // Log configuration for debugging
     LOG_INFO_MSG("INIT", "Worker configuration loaded:");
     LOG_INFO_MSG("INIT", "  uploads_path: %s", worker_config.uploads_path);
-    LOG_INFO_MSG("INIT", "  callback_timeout: %ld", worker_config.callback_timeout);
     LOG_INFO_MSG("INIT", "  vector_extraction_enabled: %s (enhanced object detection)", worker_config.vector_extraction_enabled ? "true" : "false");
+    LOG_INFO_MSG("INIT", "  max_concurrent_jobs: %d (prevents memory balloning)", worker_config.max_concurrent_jobs);
 }
 
 // Thread-safe getter functions
@@ -97,12 +129,12 @@ static const char* get_uploads_path_safe(void) {
     return worker_config.uploads_path;
 }
 
-static long get_callback_timeout_safe(void) {
-    return worker_config.callback_timeout;
-}
-
 static int get_vector_extraction_enabled_safe(void) {
     return worker_config.vector_extraction_enabled;
+}
+
+static int get_max_concurrent_jobs_safe(void) {
+    return worker_config.max_concurrent_jobs;
 }
 
 // Initialize Redis configuration from environment variables (thread-safe)
@@ -150,8 +182,8 @@ static void init_redis_config(void) {
 // Job structure for async processing
 typedef struct {
     char job_id[256];
+    char document_id[256]; // Document UUID for ticketing system
     char file_path[1024];
-    char callback_url[1024];
     char image_directory_path[1024];
     int extract_vector_images; // Flag to enable/disable vector image extraction
     int no_filter; // Flag to bypass image filtering (disabled by default)
@@ -204,13 +236,16 @@ static fz_context *base_ctx = NULL;
 static redis_consumer_t *redis_consumer = NULL;
 static volatile sig_atomic_t shutdown_requested = 0;
 
+// Redis buffering context (separate from consumer for result buffering)
+static redisContext *redis_buffer_ctx = NULL;
+static pthread_mutex_t redis_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // Function declarations
-static int parse_request_handler(struct mg_connection *conn, void *cbdata);
-static int health_handler(struct mg_connection *conn, void *cbdata);
-static int metrics_handler(struct mg_connection *conn, void *cbdata);
+static int init_redis_buffer(void);
+static void cleanup_redis_buffer(void);
 static void* process_document_job(void *arg);
 static parse_result_t* parse_document_with_mupdf_filtered(const char *file_path, const char *image_directory_path, int extract_vector_images, int no_filter);
-static void send_callback_response(const char *callback_url, const char *job_id, parse_result_t *result);
+static void send_result_via_websocket(const char *job_id, const char *document_id, parse_result_t *result, uint64_t processing_time_ms);
 // Function declarations for external implementations
 json_object* extract_text_blocks(fz_context *ctx, fz_document *doc);
 json_object* extract_paragraphs(fz_context *ctx, fz_document *doc);
@@ -224,10 +259,267 @@ static int init_redis_consumer(void);
 static void cleanup_redis_consumer(void);
 static redis_config_t load_redis_config(void);
 
-// File-based callback functions
-static int create_results_directory_for_org(const char *image_directory_path);
-static int write_result_to_file(const char *job_id, const char *json_data, const char *image_directory_path);
-static void send_callback_with_file(const char *callback_url, const char *job_id, parse_result_t *result, const char *image_directory_path);
+/*
+ * WebSocket message handler - called when message received from Airag
+ */
+static void on_ws_message(const char *msg_type, json_object *msg, void *user_data) {
+    (void)user_data;
+
+    LOG_DEBUG_MSG("WS", "Received message: %s", msg_type);
+
+    if (strcmp(msg_type, WS_MSG_TYPE_JOB_SUBMIT) == 0) {
+        // Extract data object from message
+        json_object *data_obj = json_object_object_get(msg, "data");
+        if (!data_obj) {
+            LOG_ERROR_MSG("WS", "Invalid job_submit message: missing data field");
+            return;
+        }
+
+        // Extract job details from data object
+        json_object *job_id_obj = json_object_object_get(data_obj, "job_id");
+        json_object *file_path_obj = json_object_object_get(data_obj, "file_path");
+        json_object *options_obj = json_object_object_get(data_obj, "options");
+
+        if (!job_id_obj || !file_path_obj) {
+            LOG_ERROR_MSG("WS", "Invalid job_submit message: missing required fields");
+            return;
+        }
+
+        const char *job_id = json_object_get_string(job_id_obj);
+        const char *file_path = json_object_get_string(file_path_obj);
+
+        // Extract options
+        int extract_vector_images = get_vector_extraction_enabled_safe();
+        int no_filter = 0;
+        const char *image_directory_path = NULL;
+        const char *document_id = NULL;
+
+        if (options_obj) {
+            json_object *doc_id_obj = json_object_object_get(options_obj, "document_id");
+            if (doc_id_obj) {
+                document_id = json_object_get_string(doc_id_obj);
+            }
+
+            json_object *vector_obj = json_object_object_get(options_obj, "vector_extraction");
+            if (vector_obj) {
+                extract_vector_images = json_object_get_boolean(vector_obj);
+            }
+
+            json_object *filter_obj = json_object_object_get(options_obj, "no_image_filter");
+            if (filter_obj) {
+                no_filter = json_object_get_boolean(filter_obj);
+            }
+
+            json_object *img_dir_obj = json_object_object_get(options_obj, "image_directory_path");
+            if (img_dir_obj) {
+                image_directory_path = json_object_get_string(img_dir_obj);
+            }
+        }
+
+        LOG_INFO_MSG("WS", "Job received via WebSocket: %s (file: %s)", job_id, file_path);
+
+        // Send initial progress (REQUIRED for frontend tracking)
+        send_job_progress(job_id, "started", 0, "job_received");
+
+        // Create job argument structure
+        parse_job_t *job = malloc(sizeof(parse_job_t));
+        if (!job) {
+            LOG_ERROR_MSG("WS", "Failed to allocate memory for job");
+            send_job_progress(job_id, "failed", 0, "memory_allocation_failed");
+            return;
+        }
+
+        strncpy(job->file_path, file_path, sizeof(job->file_path) - 1);
+        job->file_path[sizeof(job->file_path) - 1] = '\0';
+        strncpy(job->job_id, job_id, sizeof(job->job_id) - 1);
+        job->job_id[sizeof(job->job_id) - 1] = '\0';
+
+        if (document_id) {
+            strncpy(job->document_id, document_id, sizeof(job->document_id) - 1);
+            job->document_id[sizeof(job->document_id) - 1] = '\0';
+        } else {
+            job->document_id[0] = '\0';
+        }
+
+        if (image_directory_path) {
+            strncpy(job->image_directory_path, image_directory_path,
+                    sizeof(job->image_directory_path) - 1);
+            job->image_directory_path[sizeof(job->image_directory_path) - 1] = '\0';
+        } else {
+            job->image_directory_path[0] = '\0';
+        }
+
+        job->extract_vector_images = extract_vector_images;
+        job->no_filter = no_filter;
+
+        // Submit job to thread pool
+        if (pthread_create(&job->thread, NULL, process_document_job, job) != 0) {
+            LOG_ERROR_MSG("WS", "Failed to create processing thread for job %s", job_id);
+            send_job_progress(job_id, "failed", 0, "thread_creation_failed");
+            free(job);
+            return;
+        }
+
+        pthread_detach(job->thread);
+        LOG_INFO_MSG("WS", "Job %s submitted to processing thread", job_id);
+    }
+    else if (strcmp(msg_type, "ack") == 0) {
+        // Heartbeat acknowledgment from server - silently ignore
+        LOG_DEBUG_MSG("WS", "Received heartbeat ACK from server");
+    }
+    else {
+        LOG_WARN_MSG("WS", "Unknown message type: %s", msg_type);
+    }
+}
+
+/*
+ * WebSocket state change handler
+ */
+static void on_ws_state_change(ws_client_state_t old_state, ws_client_state_t new_state, void *user_data) {
+    (void)user_data;
+
+    const char *state_names[] = {"DISCONNECTED", "CONNECTING", "CONNECTED", "CLOSING", "ERROR"};
+    LOG_INFO_MSG("WS", "State change: %s -> %s",
+             state_names[old_state], state_names[new_state]);
+
+    if (new_state == WS_STATE_CONNECTED) {
+        LOG_INFO_MSG("WS", "Worker ONLINE - ready to receive jobs");
+        health_update_status("healthy");
+        // Ticketing system handles offline delivery automatically
+    }
+    else if (new_state == WS_STATE_DISCONNECTED || new_state == WS_STATE_ERROR) {
+        LOG_WARN_MSG("WS", "Worker OFFLINE - reconnecting...");
+        health_update_status("reconnecting");
+    }
+}
+
+/*
+ * Send job progress via WebSocket (REQUIRED for frontend tracking)
+ */
+static void send_job_progress(const char *job_id, const char *status, int progress_percent, const char *current_step) {
+    if (!ws_client || !ws_client_is_connected(ws_client)) {
+        LOG_WARN_MSG("WS", "Cannot send progress: not connected");
+        return;
+    }
+
+    json_object *progress = json_object_new_object();
+    json_object_object_add(progress, "job_id", json_object_new_string(job_id));
+    json_object_object_add(progress, "status", json_object_new_string(status));
+    json_object_object_add(progress, "progress_percent", json_object_new_int(progress_percent));
+    json_object_object_add(progress, "current_step", json_object_new_string(current_step));
+    json_object_object_add(progress, "timestamp", json_object_new_int64(time(NULL)));
+
+    if (ws_client_send_message(ws_client, WS_MSG_TYPE_JOB_PROGRESS, progress) != 0) {
+        LOG_ERROR_MSG("WS", "Failed to send progress for job %s", job_id);
+    }
+
+    json_object_put(progress);
+}
+
+/*
+ * Store result as ticket in Redis and return ticket ID
+ * This allows sending large payloads without hitting WebSocket message size limits
+ * Returns 0 on success, -1 on error
+ */
+static int store_result_ticket(const char *job_id, const char *document_id, const char *result_json) {
+    pthread_mutex_lock(&redis_buffer_mutex);
+
+    if (!redis_buffer_ctx) {
+        pthread_mutex_unlock(&redis_buffer_mutex);
+        LOG_ERROR_MSG("REDIS", "Cannot store ticket: Redis not connected");
+        return -1;
+    }
+
+    if (!document_id || strlen(document_id) == 0) {
+        pthread_mutex_unlock(&redis_buffer_mutex);
+        LOG_ERROR_MSG("TICKET", "Cannot store ticket: document_id is empty for job %s", job_id);
+        return -1;
+    }
+
+    // Store ticket in Redis with 5 minute TTL (enough for delivery + confirmation)
+    // Use document_id directly as ticket ID for simplified tracking
+    char key[512];
+    snprintf(key, sizeof(key), "worker:ticket:%s", document_id);
+
+    redisReply *reply = redisCommand(redis_buffer_ctx, "SETEX %s 300 %s", key, result_json);
+
+    if (reply == NULL || reply->type == REDIS_REPLY_ERROR) {
+        LOG_ERROR_MSG("REDIS", "Failed to store result ticket for job %s (document %s)", job_id, document_id);
+        if (reply) freeReplyObject(reply);
+        pthread_mutex_unlock(&redis_buffer_mutex);
+        return -1;
+    }
+
+    freeReplyObject(reply);
+    pthread_mutex_unlock(&redis_buffer_mutex);
+
+    LOG_INFO_MSG("TICKET", "Stored result ticket for document %s (job %s, %zu bytes)",
+                 document_id, job_id, strlen(result_json));
+    return 0;
+}
+
+/*
+ * Send result via WebSocket using ticket system (no size limits)
+ * Uses document_id as ticket ID for simplified tracking
+ */
+static void send_result_via_websocket(const char *job_id, const char *document_id, parse_result_t *result, uint64_t processing_time_ms) {
+    if (!ws_client || !ws_client_is_connected(ws_client)) {
+        LOG_ERROR_MSG("WS", "Cannot send result: not connected");
+        return;
+    }
+
+    // Build result JSON (same structure as before)
+    json_object *result_obj = json_object_new_object();
+    json_object_object_add(result_obj, "job_id", json_object_new_string(job_id));
+    json_object_object_add(result_obj, "status", json_object_new_string("completed"));
+
+    json_object *data = json_object_new_object();
+    if (result) {
+        if (result->text_blocks) {
+            json_object_object_add(data, "text_blocks", json_object_get(result->text_blocks));
+        }
+        if (result->paragraphs) {
+            json_object_object_add(data, "paragraphs", json_object_get(result->paragraphs));
+        }
+        if (result->images) {
+            json_object_object_add(data, "images", json_object_get(result->images));
+        }
+    }
+
+    json_object_object_add(data, "processing_time_ms",
+                           json_object_new_int64((int64_t)processing_time_ms));
+
+    json_object_object_add(result_obj, "result", data);
+
+    // Convert to JSON string
+    const char *result_json = json_object_to_json_string(result_obj);
+    size_t result_size = strlen(result_json);
+
+    // Store result as ticket in Redis using document_id
+    if (store_result_ticket(job_id, document_id, result_json) != 0) {
+        LOG_ERROR_MSG("TICKET", "Failed to store result ticket for job %s (document %s)", job_id, document_id);
+        json_object_put(result_obj);
+        return;
+    }
+
+    // Send tiny ticket message via WebSocket (no size limits)
+    // Use document_id as ticket_id for direct document tracking
+    json_object *ticket_msg = json_object_new_object();
+    json_object_object_add(ticket_msg, "job_id", json_object_new_string(job_id));
+    json_object_object_add(ticket_msg, "status", json_object_new_string("completed"));
+    json_object_object_add(ticket_msg, "ticket_id", json_object_new_string(document_id));
+    json_object_object_add(ticket_msg, "result_size", json_object_new_int64((int64_t)result_size));
+
+    if (ws_client_send_message(ws_client, WS_MSG_TYPE_JOB_RESULT, ticket_msg) != 0) {
+        LOG_ERROR_MSG("WS", "Failed to send ticket for job %s", job_id);
+        // Ticket is already in Redis, airag can fetch it later via cleanup job
+    } else {
+        LOG_INFO_MSG("WS", "Sent ticket %s (document %s) for job %s (%zu bytes)", document_id, document_id, job_id, result_size);
+    }
+
+    json_object_put(ticket_msg);
+    json_object_put(result_obj);
+}
 
 int main(int argc __attribute__((unused)), char **argv __attribute__((unused))) {
     // Initialize monitoring system FIRST
@@ -246,7 +538,7 @@ int main(int argc __attribute__((unused)), char **argv __attribute__((unused))) 
         set_log_level(level);
     }
 
-    LOG_INFO_MSG("MAIN", "Starting MuPDF Document Parsing Service on port %s", PORT);
+    LOG_INFO_MSG("MAIN", "Starting MuPDF Document Parsing Service with WebSocket");
 
     // Initialize worker configuration from environment variables
     init_worker_config();
@@ -254,20 +546,48 @@ int main(int argc __attribute__((unused)), char **argv __attribute__((unused))) 
     // Initialize Redis configuration from environment variables
     init_redis_config();
 
+    // Initialize semaphore for concurrency control
+    if (sem_init(&job_semaphore, 0, get_max_concurrent_jobs_safe()) != 0) {
+        LOG_FATAL_MSG("MAIN", "Failed to initialize job semaphore");
+        monitoring_cleanup();
+        return 1;
+    }
+    LOG_INFO_MSG("INIT", "Job semaphore initialized with limit: %d", get_max_concurrent_jobs_safe());
+
     // Setup signal handlers for graceful shutdown
     (void)signal(SIGINT, signal_handler);
     (void)signal(SIGTERM, signal_handler);
 
-    // Initialize MuPDF
-    base_ctx = fz_new_context(NULL, NULL, FZ_STORE_DEFAULT);
+    // Initialize MuPDF locks for thread-safety
+    for (int i = 0; i < FZ_LOCK_MAX; i++) {
+        if (pthread_mutex_init(&mupdf_locks[i], NULL) != 0) {
+            LOG_FATAL_MSG("MAIN", "Failed to initialize MuPDF mutex %d", i);
+            for (int j = 0; j < i; j++) {
+                pthread_mutex_destroy(&mupdf_locks[j]);
+            }
+            monitoring_cleanup();
+            return 1;
+        }
+    }
+
+    // Initialize MuPDF with locking for multi-threaded use
+    // Increased store size from default (256MB) to 512MB to reduce ICC cache conflicts
+    base_ctx = fz_new_context(NULL, &mupdf_locks_ctx, 512 << 20);  // 512MB store
     if (!base_ctx) {
         LOG_FATAL_MSG("MAIN", "Failed to initialize MuPDF context");
+        for (int i = 0; i < FZ_LOCK_MAX; i++) {
+            pthread_mutex_destroy(&mupdf_locks[i]);
+        }
         monitoring_cleanup();
         return 1;
     }
 
     // Register document handlers
     fz_register_document_handlers(base_ctx);
+
+    // Enable ICC color management with proper initialization
+    // This ensures ICC profiles are properly cached and shared across threads
+    fz_enable_icc(base_ctx);
 
     // Results directories will be created per-organization as needed
 
@@ -295,58 +615,89 @@ int main(int argc __attribute__((unused)), char **argv __attribute__((unused))) 
         health_update_component_status(1, 1, 0); // MuPDF OK, Redis OK
     }
 
-    // Configure CivetWeb options
-    const char *options[] = {
-        "listening_ports", "0.0.0.0:8080",
-        "num_threads", "8",
-        "request_timeout_ms", "30000",
-        NULL
+    // Initialize Redis buffer for result buffering (separate connection)
+    if (init_redis_buffer() != 0) {
+        LOG_WARN_MSG("MAIN", "Redis buffer initialization failed (result buffering disabled)");
+    }
+
+    // Initialize WebSocket client configuration
+    const char *airag_host = getenv("AIRAG_HOST");
+    if (!airag_host) {
+        airag_host = "airag"; // Default to Docker service name
+    }
+
+    const char *airag_port_str = getenv("AIRAG_PORT");
+    int airag_port = airag_port_str ? atoi(airag_port_str) : 1807;
+
+    const char *ws_path = getenv("AIRAG_WS_PATH");
+    if (!ws_path) {
+        ws_path = "/ws/worker";
+    }
+
+    ws_client_config_t ws_config = {
+        .airag_host = airag_host,
+        .airag_port = airag_port,
+        .ws_path = ws_path,
+        .heartbeat_interval = 10,  // 10 seconds
+        .reconnect_interval = 5,   // 5 seconds
+        .connect_timeout = 10,     // 10 seconds
+        .on_message = on_ws_message,
+        .on_state_change = on_ws_state_change,
+        .user_data = NULL
     };
 
-    // Set up HTTP request handlers
-    struct mg_callbacks callbacks;
-    memset(&callbacks, 0, sizeof(callbacks));
-
-    // Start the web server
-    struct mg_context *ctx = mg_start(&callbacks, NULL, options);
-    if (!ctx) {
-        (void)fprintf(stderr, "Failed to start HTTP server\n");
+    ws_client = ws_client_create(&ws_config);
+    if (!ws_client) {
+        LOG_FATAL_MSG("WS", "Failed to create WebSocket client: %s", ws_client_get_error());
         fz_drop_context(base_ctx);
+        monitoring_cleanup();
         return 1;
     }
 
-    // Register endpoint handlers
-    mg_set_request_handler(ctx, "/parse", parse_request_handler, NULL);
-    mg_set_request_handler(ctx, "/health", health_handler, NULL);
-    mg_set_request_handler(ctx, "/metrics", metrics_handler, NULL);
+    LOG_INFO_MSG("WS", "Connecting to Airag at ws://%s:%d%s", airag_host, airag_port, ws_path);
 
-    // HTTP service is now ready
-    health_update_component_status(1, redis_consumer ? 1 : 0, 1); // Update HTTP status
-    health_update_status("healthy");
-
-    LOG_INFO_MSG("MAIN", "MuPDF Service ready! Endpoints:");
-    LOG_INFO_MSG("MAIN", "  POST /parse    - Parse document (requires: file_path, job_id, callback_url)");
-    LOG_INFO_MSG("MAIN", "  GET  /health   - Production health check with metrics");
-    LOG_INFO_MSG("MAIN", "  GET  /metrics  - Detailed performance metrics");
-    if (redis_consumer) {
-        LOG_INFO_MSG("MAIN", "  Redis Queue   - Consumer active (queue=worker_jobs)");
+    if (ws_client_connect(ws_client) != 0) {
+        LOG_WARN_MSG("WS", "Initial connection failed: %s (will retry automatically)", ws_client_get_error());
     }
-    LOG_INFO_MSG("MAIN", "Service running... (Ctrl+C to shutdown)");
 
-    // Keep the service running - wait for termination signal
+    LOG_INFO_MSG("MAIN", "MuPDF Worker ready!");
+    LOG_INFO_MSG("MAIN", "  WebSocket: ws://%s:%d%s", airag_host, airag_port, ws_path);
+    if (redis_consumer) {
+        LOG_INFO_MSG("MAIN", "  Redis Queue: Active (queue=worker_jobs)");
+    }
+    LOG_INFO_MSG("MAIN", "Worker running... (Ctrl+C to shutdown)");
+
+    // Main event loop - process WebSocket events
     while (!shutdown_requested) {
-        sleep(1);
+        // Process WebSocket events (1 second timeout)
+        ws_client_process(ws_client, 1000);
     }
 
     LOG_INFO_MSG("MAIN", "Shutdown requested, cleaning up...");
 
+    // Cleanup WebSocket client
+    if (ws_client) {
+        ws_client_close(ws_client);
+        ws_client_destroy(ws_client);
+    }
+
     // Cleanup Redis consumer
     cleanup_redis_consumer();
 
-    // Cleanup HTTP server
-    mg_stop(ctx);
+    // Cleanup Redis buffer
+    cleanup_redis_buffer();
+
+    // Cleanup resources
     curl_global_cleanup();
     fz_drop_context(base_ctx);
+
+    // Cleanup MuPDF locks
+    for (int i = 0; i < FZ_LOCK_MAX; i++) {
+        pthread_mutex_destroy(&mupdf_locks[i]);
+    }
+
+    // Cleanup semaphore
+    sem_destroy(&job_semaphore);
 
     // Cleanup monitoring system
     monitoring_cleanup();
@@ -356,121 +707,18 @@ int main(int argc __attribute__((unused)), char **argv __attribute__((unused))) 
 }
 
 /*
- * HTTP request handler for document parsing
- * Expected JSON payload:
- * {
- *   "file_path": "/path/to/document.pdf",
- *   "job_id": "unique-job-identifier",
- *   "callback_url": "http://rag-service/callback",
- *   "image_directory_path": "/app/uploads/images/default"
- * }
- */
-static int parse_request_handler(struct mg_connection *conn, void *cbdata __attribute__((unused))) {
-    metrics_http_request_received();
-
-    if (strcmp(mg_get_request_info(conn)->request_method, "POST") != 0) {
-        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed\r\n"
-                        "Content-Type: application/json\r\n\r\n"
-                        "{\"error\": \"Only POST method allowed\"}\n");
-        LOG_WARN_MSG("HTTP", "Invalid request method: %s", mg_get_request_info(conn)->request_method);
-        return 1;
-    }
-
-    // Read request body
-    char buffer[BUFFER_SIZE];
-    int data_len = mg_read(conn, buffer, sizeof(buffer) - 1);
-    if (data_len <= 0) {
-        mg_printf(conn, "HTTP/1.1 400 Bad Request\r\n"
-                        "Content-Type: application/json\r\n\r\n"
-                        "{\"error\": \"No request body\"}\n");
-        return 1;
-    }
-    buffer[data_len] = '\0';
-
-    // Parse JSON request
-    json_object *json = json_tokener_parse(buffer);
-    if (!json) {
-        mg_printf(conn, "HTTP/1.1 400 Bad Request\r\n"
-                        "Content-Type: application/json\r\n\r\n"
-                        "{\"error\": \"Invalid JSON\"}\n");
-        return 1;
-    }
-
-    // Extract required fields
-    json_object *file_path_obj = NULL;
-    json_object *job_id_obj = NULL;
-    json_object *callback_url_obj = NULL;
-    json_object *image_directory_path_obj = NULL;
-    if (!json_object_object_get_ex(json, "file_path", &file_path_obj) ||
-        !json_object_object_get_ex(json, "job_id", &job_id_obj) ||
-        !json_object_object_get_ex(json, "callback_url", &callback_url_obj) ||
-        !json_object_object_get_ex(json, "image_directory_path", &image_directory_path_obj)) {
-
-        mg_printf(conn, "HTTP/1.1 400 Bad Request\r\n"
-                        "Content-Type: application/json\r\n\r\n"
-                        "{\"error\": \"Missing required fields: file_path, job_id, callback_url, image_directory_path\"}\n");
-        json_object_put(json);
-        return 1;
-    }
-
-    // Extract string values
-    const char *image_directory_path = json_object_get_string(image_directory_path_obj);
-
-    // Extract optional vector extraction flag (enhanced object detection enabled by default)
-    json_object *vector_extraction_obj = NULL;
-    int extract_vector_images = get_vector_extraction_enabled_safe(); // Use environment default (true)
-    if (json_object_object_get_ex(json, "extract_vector_images", &vector_extraction_obj)) {
-        extract_vector_images = json_object_get_boolean(vector_extraction_obj);
-    }
-
-    // Extract optional no_filter flag (defaults to false - filtering enabled)
-    json_object *no_filter_obj = NULL;
-    int no_filter = 0; // By default, image filtering is enabled
-    if (json_object_object_get_ex(json, "no_filter", &no_filter_obj)) {
-        no_filter = json_object_get_boolean(no_filter_obj);
-    }
-
-    // Create job for async processing
-    parse_job_t *job = malloc(sizeof(parse_job_t));
-    strncpy(job->file_path, json_object_get_string(file_path_obj), sizeof(job->file_path) - 1);
-    strncpy(job->job_id, json_object_get_string(job_id_obj), sizeof(job->job_id) - 1);
-    strncpy(job->callback_url, json_object_get_string(callback_url_obj), sizeof(job->callback_url) - 1);
-    strncpy(job->image_directory_path, json_object_get_string(image_directory_path_obj), sizeof(job->image_directory_path) - 1);
-    job->image_directory_path[sizeof(job->image_directory_path) - 1] = '\0';
-    job->extract_vector_images = extract_vector_images;
-    job->no_filter = no_filter;
-
-    // Start async processing
-    if (pthread_create(&job->thread, NULL, process_document_job, job) != 0) {
-        mg_printf(conn, "HTTP/1.1 500 Internal Server Error\r\n"
-                        "Content-Type: application/json\r\n\r\n"
-                        "{\"error\": \"Failed to start processing job\"}\n");
-        free(job);
-        json_object_put(json);
-        return 1;
-    }
-
-    // Detach thread for cleanup
-    pthread_detach(job->thread);
-
-    // Send immediate response
-    mg_printf(conn, "HTTP/1.1 202 Accepted\r\n"
-                    "Content-Type: application/json\r\n\r\n"
-                    "{\"status\": \"accepted\", \"job_id\": \"%s\"}\n",
-                    json_object_get_string(job_id_obj));
-
-    metrics_http_request_completed();
-    LOG_INFO_MSG("HTTP", "Job accepted: %s", json_object_get_string(job_id_obj));
-
-    json_object_put(json);
-    return 1;
-}
-
-/*
  * Async document processing worker
  */
 static void* process_document_job(void *arg) {
     parse_job_t *job = (parse_job_t*)arg;
+
+    // Acquire semaphore to limit concurrent processing
+    LOG_INFO_MSG("JOB", "Job %s waiting for semaphore slot...", job->job_id);
+    sem_wait(&job_semaphore);
+    LOG_INFO_MSG("JOB", "Job %s acquired semaphore, starting processing", job->job_id);
+
+    // Progress: Job started (0%)
+    send_job_progress(job->job_id, "processing", 0, "started");
 
     metrics_job_started();
     log_job_start(job->job_id, job->file_path);
@@ -479,16 +727,31 @@ static void* process_document_job(void *arg) {
     struct timeval end_time;
     (void)gettimeofday(&start_time, NULL);
 
+    // Progress: Parsing (25%)
+    send_job_progress(job->job_id, "processing", 25, "parsing");
+
     // Parse document with MuPDF
     parse_result_t *result = parse_document_with_mupdf_filtered(job->file_path, job->image_directory_path, job->extract_vector_images, job->no_filter);
+
+    // Progress: Extracting text (50%)
+    send_job_progress(job->job_id, "processing", 50, "extracting_text");
+
+    // Progress: Extracting images (75%)
+    send_job_progress(job->job_id, "processing", 75, "extracting_images");
+
+    // Progress: Finalizing (90%)
+    send_job_progress(job->job_id, "processing", 90, "finalizing");
 
     // Calculate processing time
     (void)gettimeofday(&end_time, NULL);
     uint64_t processing_time_ms = ((end_time.tv_sec - start_time.tv_sec) * 1000) +
                                   ((end_time.tv_usec - start_time.tv_usec) / 1000);
 
-    // Send results via file-based callback
-    send_callback_with_file(job->callback_url, job->job_id, result, job->image_directory_path);
+    // Send result via WebSocket (with Redis buffering fallback)
+    // Always use ticketing system regardless of WebSocket status
+    // Ticket stored in Redis with 5-minute TTL for airag to pick up
+    send_job_progress(job->job_id, "completed", 100, "completed");
+    send_result_via_websocket(job->job_id, job->document_id, result, processing_time_ms);
 
     // Update metrics based on result
     if (result && result->metadata) {
@@ -519,6 +782,10 @@ static void* process_document_job(void *arg) {
     }
     free(job);
 
+    // Release semaphore to allow next job
+    sem_post(&job_semaphore);
+    LOG_INFO_MSG("JOB", "Job completed, semaphore slot released");
+
     return NULL;
 }
 
@@ -529,15 +796,20 @@ static void* process_document_job(void *arg) {
 static parse_result_t* parse_document_with_mupdf_filtered(const char *file_path, const char *image_directory_path, int extract_vector_images, int no_filter) {
     LOG_INFO_MSG("PARSE", "Starting document parsing for file: %s", file_path);
 
-    // Use global context directly (single-threaded processing)
+    // Clone context for thread-safety (each thread needs its own context)
     if (!base_ctx) {
         LOG_FATAL_MSG("PARSE", "base_ctx is NULL when trying to parse %s", file_path);
         fprintf(stderr, "ERROR: base_ctx is NULL when trying to parse %s\n", file_path);
         return NULL;
     }
 
-    fz_context *ctx = base_ctx; // Use base context directly instead of cloning
-    LOG_DEBUG_MSG("PARSE", "Using base MuPDF context for parsing: %s", file_path);
+    fz_context *ctx = fz_clone_context(base_ctx);
+    if (!ctx) {
+        LOG_FATAL_MSG("PARSE", "Failed to clone MuPDF context for %s", file_path);
+        fprintf(stderr, "ERROR: Failed to clone context for %s\n", file_path);
+        return NULL;
+    }
+    LOG_DEBUG_MSG("PARSE", "Cloned MuPDF context for thread-safe parsing: %s", file_path);
 
     parse_result_t *result = calloc(1, sizeof(parse_result_t));
     if (!result) {
@@ -559,6 +831,16 @@ static parse_result_t* parse_document_with_mupdf_filtered(const char *file_path,
         int page_count = fz_count_pages(ctx, doc);
         LOG_INFO_MSG("PARSE", "Document opened successfully: %s (pages: %d)", file_path, page_count);
 
+        // Safeguard: Limit pages for documents with excessive page counts
+        const int MAX_PAGES = 5000;
+        const int TEST_PAGES_LIMIT = 2; // For testing Excel rendering
+
+        if (page_count > MAX_PAGES) {
+            LOG_WARN_MSG("PARSE", "Document has excessive pages (%d > %d), limiting to first %d pages for testing: %s",
+                        page_count, MAX_PAGES, TEST_PAGES_LIMIT, file_path);
+            page_count = TEST_PAGES_LIMIT; // Override to process only first 2 pages
+        }
+
         // Extract content with coordinates
         LOG_DEBUG_MSG("PARSE", "Extracting text blocks from document: %s", file_path);
         result->text_blocks = extract_text_blocks(ctx, doc);
@@ -571,7 +853,7 @@ static parse_result_t* parse_document_with_mupdf_filtered(const char *file_path,
         LOG_INFO_MSG("PARSE", "Extracted %d paragraphs from: %s", paragraph_count, file_path);
 
         LOG_DEBUG_MSG("PARSE", "Extracting images from document: %s", file_path);
-        result->images = extract_images_filtered(base_ctx, doc, image_directory_path, extract_vector_images, no_filter);
+        result->images = extract_images_filtered(ctx, doc, image_directory_path, extract_vector_images, no_filter);
         int image_count = result->images ? (int)json_object_array_length(result->images) : 0;
         LOG_INFO_MSG("PARSE", "Extracted %d images from: %s", image_count, file_path);
 
@@ -605,109 +887,14 @@ static parse_result_t* parse_document_with_mupdf_filtered(const char *file_path,
     if (doc) {
         fz_drop_document(ctx, doc);
     }
-    // Note: Not dropping ctx since we're using base_ctx directly
+
+    // Drop cloned context (thread-local)
+    fz_drop_context(ctx);
 
     return result;
 }
 
 
-/*
- * Send processing results back to RAG service via HTTP callback
- */
-static void send_callback_response(const char *callback_url, const char *job_id, parse_result_t *result) {
-    LOG_INFO_MSG("CALLBACK", "Preparing to send callback for job %s to %s", job_id, callback_url);
-
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        LOG_ERROR_MSG("CALLBACK", "Failed to initialize CURL for callback (job: %s)", job_id);
-        fprintf(stderr, "Failed to initialize CURL for callback\n");
-        return;
-    }
-
-    // Build response JSON
-    LOG_DEBUG_MSG("CALLBACK", "Building JSON response for job %s", job_id);
-    // Create JSON response
-    json_object *response = json_object_new_object();
-    (void)json_object_object_add(response, "timestamp", json_object_new_int64((int64_t)time(NULL)));
-    json_object_object_add(response, "job_id", json_object_new_string(job_id));
-
-    int text_block_count = 0;
-    int paragraph_count = 0;
-    int image_count = 0;
-    const char *status = "unknown";
-
-    if (result) {
-        LOG_DEBUG_MSG("CALLBACK", "Result object available for job %s", job_id);
-
-        if (result->text_blocks) {
-            text_block_count = (int)json_object_array_length(result->text_blocks);
-            json_object_object_add(response, "text_blocks", json_object_get(result->text_blocks));
-            LOG_DEBUG_MSG("CALLBACK", "Added %d text blocks to response for job %s", text_block_count, job_id);
-        }
-
-        if (result->paragraphs) {
-            paragraph_count = (int)json_object_array_length(result->paragraphs);
-            json_object_object_add(response, "paragraphs", json_object_get(result->paragraphs));
-            LOG_DEBUG_MSG("CALLBACK", "Added %d paragraphs to response for job %s", paragraph_count, job_id);
-        }
-
-        if (result->images) {
-            image_count = (int)json_object_array_length(result->images);
-            json_object_object_add(response, "images", json_object_get(result->images));
-            LOG_DEBUG_MSG("CALLBACK", "Added %d images to response for job %s", image_count, job_id);
-        }
-        if (result->metadata) {
-            json_object_object_add(response, "metadata", json_object_get(result->metadata));
-
-            // Extract status from metadata for logging
-            json_object *status_obj = NULL;
-            if (json_object_object_get_ex(result->metadata, "status", &status_obj)) {
-                status = json_object_get_string(status_obj);
-            }
-            LOG_DEBUG_MSG("CALLBACK", "Added metadata to response for job %s (status: %s)", job_id, status);
-        }
-    } else {
-        LOG_WARN_MSG("CALLBACK", "No result object for job %s", job_id);
-    }
-
-    const char *json_string = json_object_to_json_string(response);
-    size_t json_length = strlen(json_string);
-
-    LOG_INFO_MSG("CALLBACK", "Sending callback for job %s: status=%s, text_blocks=%d, paragraphs=%d, images=%d, json_size=%zu",
-                 job_id, status, text_block_count, paragraph_count, image_count, json_length);
-
-    // Configure CURL for callback
-    curl_easy_setopt(curl, CURLOPT_URL, callback_url);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_string);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)json_length);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, get_callback_timeout_safe()); // Configurable timeout for airag processing
-
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    LOG_DEBUG_MSG("CALLBACK", "Executing HTTP POST to %s for job %s", callback_url, job_id);
-
-    // Send callback
-    CURLcode res = curl_easy_perform(curl);
-
-    long response_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-
-    if (res != CURLE_OK) {
-        LOG_ERROR_MSG("CALLBACK", "Callback failed for job %s: %s (URL: %s)",
-                      job_id, curl_easy_strerror(res), callback_url);
-        fprintf(stderr, "Callback failed: %s\n", curl_easy_strerror(res));
-    } else {
-        LOG_INFO_MSG("CALLBACK", "Callback sent successfully for job %s: HTTP %ld (status: %s)",
-                     job_id, response_code, status);
-        printf("Callback sent for job %s (HTTP %ld)\n", job_id, response_code);
-    }
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    (void)json_object_put(response);
-}
 
 /*
  * Cleanup parsing results
@@ -750,6 +937,11 @@ static int redis_job_processor(const redis_job_t *job) {
         return -1;
     }
 
+    // Acquire semaphore to limit concurrent processing
+    LOG_INFO_MSG("JOB", "Redis job %s waiting for semaphore slot...", job->job_id);
+    sem_wait(&job_semaphore);
+    LOG_INFO_MSG("JOB", "Redis job %s acquired semaphore, starting processing", job->job_id);
+
     metrics_redis_job_received();
     metrics_job_started();
     log_job_start(job->job_id, job->file_path);
@@ -766,44 +958,39 @@ static int redis_job_processor(const redis_job_t *job) {
     uint64_t processing_time_ms = ((end_time.tv_sec - start_time.tv_sec) * 1000) +
                                   ((end_time.tv_usec - start_time.tv_usec) / 1000);
 
+    // Always use ticketing system regardless of WebSocket status
+    // Ticket stored in Redis with 5-minute TTL for airag to pick up
+    send_result_via_websocket(job->job_id, job->document_id, result, processing_time_ms);
+
+    // Update metrics based on result
     if (result && result->metadata) {
         json_object *status_obj = NULL;
         if (json_object_object_get_ex(result->metadata, "status", &status_obj)) {
             const char *status = json_object_get_string(status_obj);
             if (strcmp(status, "success") == 0) {
-                // Send results via file-based callback
-                send_callback_with_file(job->callback_url, job->job_id, result, job->image_directory_path);
-
                 metrics_job_completed(processing_time_ms);
                 metrics_redis_job_acknowledged();
                 log_job_complete(job->job_id, processing_time_ms);
-
-                // Cleanup
-                cleanup_parse_result(result);
-                return 0;
+            } else {
+                const char *error = "Document processing failed";
+                json_object *error_obj = NULL;
+                if (json_object_object_get_ex(result->metadata, "error", &error_obj)) {
+                    error = json_object_get_string(error_obj);
+                }
+                metrics_job_failed(processing_time_ms, error);
+                log_job_error(job->job_id, error);
             }
         }
     }
-
-    // Job failed
-    const char *error = "Document processing failed";
-    if (result && result->metadata) {
-        json_object *error_obj = NULL;
-        if (json_object_object_get_ex(result->metadata, "error", &error_obj)) {
-            error = json_object_get_string(error_obj);
-        }
-    }
-
-    metrics_job_failed(processing_time_ms, error);
-    log_job_error(job->job_id, error);
-
-    // Still send callback even for failed jobs
-    send_callback_with_file(job->callback_url, job->job_id, result, job->image_directory_path);
 
     // Cleanup
     if (result) {
         cleanup_parse_result(result);
     }
+
+    // Release semaphore even on failure
+    sem_post(&job_semaphore);
+    LOG_INFO_MSG("JOB", "Redis job completed with errors, semaphore slot released");
     LOG_DEBUG_MSG("CALLBACK", "Finished processing job %s", job->job_id);
     return -1;
 }
@@ -875,255 +1062,79 @@ static void cleanup_redis_consumer(void) {
  * Load Redis configuration from environment variables
  */
 static redis_config_t load_redis_config(void) {
-    printf("[Redis] Configuration: %s:%d (db=%d)\n", 
+    printf("[Redis] Configuration: %s:%d (db=%d)\n",
            redis_config_cached.host, redis_config_cached.port, redis_config_cached.db);
     return redis_config_cached;
 }
 
 /*
- * Health check endpoint handler
+ * Initialize Redis buffer connection for result buffering
  */
-static int health_handler(struct mg_connection *conn, void *cbdata __attribute__((unused))) {
-    health_response_t *response = generate_health_response();
-    if (!response || !response->json_response) {
-        mg_printf(conn, "HTTP/1.1 500 Internal Server Error\r\n"
-                        "Content-Type: application/json\r\n\r\n"
-                        "{\"error\": \"Failed to generate health response\"}\n");
-        return 1;
-    }
+static int init_redis_buffer(void) {
+    redis_config_t config = load_redis_config();
 
-    mg_printf(conn, "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: application/json\r\n"
-                    "Content-Length: %zu\r\n\r\n%s",
-                    response->response_size, response->json_response);
+    struct timeval timeout = { config.timeout_ms / 1000, (config.timeout_ms % 1000) * 1000 };
+    redis_buffer_ctx = redisConnectWithTimeout(config.host, config.port, timeout);
 
-    free_health_response(response);
-    return 1;
-}
-
-/*
- * Metrics endpoint handler
- */
-static int metrics_handler(struct mg_connection *conn, void *cbdata __attribute__((unused))) {
-    // Update resource usage before generating response
-    metrics_update_resource_usage();
-
-    metrics_response_t *response = generate_metrics_response();
-    if (!response || !response->json_response) {
-        mg_printf(conn, "HTTP/1.1 500 Internal Server Error\r\n"
-                        "Content-Type: application/json\r\n\r\n"
-                        "{\"error\": \"Failed to generate metrics response\"}\n");
-        return 1;
-    }
-
-    mg_printf(conn, "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: application/json\r\n"
-                    "Content-Length: %zu\r\n\r\n%s",
-                    response->response_size, response->json_response);
-
-    free_metrics_response(response);
-    return 1;
-}
-
-/*
- * Recursively create directory path
- */
-static int create_directory_recursive(const char *path) {
-    char dir_path[512];
-    char *p = NULL;
-    size_t len;
-
-    // Copy path to work with
-    strncpy(dir_path, path, sizeof(dir_path) - 1);
-    dir_path[sizeof(dir_path) - 1] = '\0';
-    len = strlen(dir_path);
-
-    // Remove trailing slash if present
-    if (len > 0 && dir_path[len - 1] == '/') {
-        dir_path[len - 1] = '\0';
-    }
-
-    // Create directories recursively
-    for (p = dir_path + 1; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            if (mkdir(dir_path, 0755) != 0 && errno != EEXIST) {
-                char error_buf[256];
-                strerror_r(errno, error_buf, sizeof(error_buf));
-                LOG_ERROR_MSG("INIT", "Failed to create directory %s: %s", dir_path, error_buf);
-                return -1;
-            }
-            *p = '/';
+    if (redis_buffer_ctx == NULL || redis_buffer_ctx->err) {
+        if (redis_buffer_ctx) {
+            LOG_WARN_MSG("REDIS", "Redis buffer connection failed: %s (buffering disabled)", redis_buffer_ctx->errstr);
+            redisFree(redis_buffer_ctx);
+            redis_buffer_ctx = NULL;
+        } else {
+            LOG_WARN_MSG("REDIS", "Redis buffer connection failed: can't allocate context");
         }
-    }
-
-    // Create final directory
-    if (mkdir(dir_path, 0755) != 0 && errno != EEXIST) {
-        char error_buf[256];
-        strerror_r(errno, error_buf, sizeof(error_buf));
-        LOG_ERROR_MSG("INIT", "Failed to create directory %s: %s", dir_path, error_buf);
         return -1;
     }
 
+    // Authenticate if password is set
+    if (config.password[0] != '\0') {
+        redisReply *reply = redisCommand(redis_buffer_ctx, "AUTH %s", config.password);
+        if (reply == NULL || reply->type == REDIS_REPLY_ERROR) {
+            LOG_ERROR_MSG("REDIS", "Redis buffer auth failed");
+            if (reply) freeReplyObject(reply);
+            redisFree(redis_buffer_ctx);
+            redis_buffer_ctx = NULL;
+            return -1;
+        }
+        freeReplyObject(reply);
+    }
+
+    // Select database
+    if (config.db != 0) {
+        redisReply *reply = redisCommand(redis_buffer_ctx, "SELECT %d", config.db);
+        if (reply == NULL || reply->type == REDIS_REPLY_ERROR) {
+            LOG_ERROR_MSG("REDIS", "Redis buffer SELECT failed");
+            if (reply) freeReplyObject(reply);
+            redisFree(redis_buffer_ctx);
+            redis_buffer_ctx = NULL;
+            return -1;
+        }
+        freeReplyObject(reply);
+    }
+
+    LOG_INFO_MSG("REDIS", "Result buffering initialized (fallback for WebSocket failures)");
     return 0;
 }
 
 /*
- * Create results directory for file-based callbacks using organization path
+ * Cleanup Redis buffer connection
  */
-static int create_results_directory_for_org(const char *image_directory_path) {
-    char results_dir[512];
-    get_results_path(results_dir, sizeof(results_dir), image_directory_path);
-
-    // Create the full directory path recursively
-    if (create_directory_recursive(results_dir) != 0) {
-        return -1;
+static void cleanup_redis_buffer(void) {
+    pthread_mutex_lock(&redis_buffer_mutex);
+    if (redis_buffer_ctx) {
+        redisFree(redis_buffer_ctx);
+        redis_buffer_ctx = NULL;
+        LOG_INFO_MSG("REDIS", "Result buffering connection closed");
     }
-
-    LOG_INFO_MSG("CALLBACK", "Results directory ready for organization: %s", results_dir);
-    return 0;
+    pthread_mutex_unlock(&redis_buffer_mutex);
 }
 
 /*
- * Write result JSON to file in shared volume
+ * Buffer job result in Redis when WebSocket is unavailable
+ * Key format: worker:buffered_results:{job_id}
+ * TTL: 600 seconds (10 minutes)
  */
-static int write_result_to_file(const char *job_id, const char *json_data, const char *image_directory_path) {
-    char filepath[1024];
-    char results_dir[512];
-    get_results_path(results_dir, sizeof(results_dir), image_directory_path);
-    snprintf(filepath, sizeof(filepath), "%s/%s.json", results_dir, job_id);
+// Old buffering functions removed - ticketing system handles all delivery now
 
-    LOG_INFO_MSG("CALLBACK", "Writing result to file: %s", filepath);
 
-    FILE *file = fopen(filepath, "w");
-    if (!file) {
-        LOG_ERROR_MSG("CALLBACK", "Failed to create result file: %s", filepath);
-        return -1;
-    }
-
-    size_t written = fwrite(json_data, 1, strlen(json_data), file);
-    if (fclose(file) != 0) {
-        LOG_ERROR_MSG("CALLBACK", "Failed to close result file");
-    }
-
-    if (written != strlen(json_data)) {
-        LOG_ERROR_MSG("CALLBACK", "Incomplete write to result file");
-        if (unlink(filepath) != 0) {
-            LOG_ERROR_MSG("CALLBACK", "Failed to delete incomplete file");
-        }
-        return -1;
-    }
-
-    LOG_INFO_MSG("CALLBACK", "Result file written successfully: %s (%zu bytes)",
-                 filepath, written);
-    return 0;
-}
-
-/*
- * Send callback with file reference instead of full JSON payload
- */
-static void send_callback_with_file(const char *callback_url, const char *job_id, parse_result_t *result, const char *image_directory_path) {
-    LOG_INFO_MSG("CALLBACK", "Preparing file-based callback for job %s", job_id);
-    
-    // Ensure results directory exists for this organization
-    if (create_results_directory_for_org(image_directory_path) != 0) {
-        LOG_ERROR_MSG("CALLBACK", "Failed to create results directory, falling back to HTTP");
-        send_callback_response(callback_url, job_id, result);
-        return;
-    }
-
-    // Build full result JSON as before
-    json_object *full_result = json_object_new_object();
-    json_object_object_add(full_result, "job_id", json_object_new_string(job_id));
-
-    if (result) {
-        if (result->text_blocks) {
-            json_object_object_add(full_result, "text_blocks", json_object_get(result->text_blocks));
-        }
-        if (result->paragraphs) {
-            json_object_object_add(full_result, "paragraphs", json_object_get(result->paragraphs));
-        }
-        if (result->images) {
-            json_object_object_add(full_result, "images", json_object_get(result->images));
-        }
-        if (result->metadata) {
-            json_object_object_add(full_result, "metadata", json_object_get(result->metadata));
-        }
-    }
-
-    const char *full_json = json_object_to_json_string(full_result);
-    size_t json_size = strlen(full_json);
-
-    // Write full result to file
-    if (write_result_to_file(job_id, full_json, image_directory_path) != 0) {
-        LOG_ERROR_MSG("CALLBACK", "Failed to write result file, falling back to HTTP");
-        send_callback_response(callback_url, job_id, result); // Fallback to original HTTP
-        json_object_put(full_result);
-        return;
-    }
-
-    // Create minimal HTTP callback with file reference
-    json_object *callback = json_object_new_object();
-    if (!callback) {
-        LOG_ERROR_MSG("CALLBACK", "Failed to create callback JSON object");
-        json_object_put(full_result);
-        return;
-    }
-
-    json_object_object_add(callback, "job_id", json_object_new_string(job_id));
-    json_object_object_add(callback, "status", json_object_new_string("success"));
-    json_object_object_add(callback, "result_file",
-                          json_object_new_string(job_id)); // Just job_id, airag will construct full path
-    json_object_object_add(callback, "result_size", json_object_new_int64((int64_t)json_size));
-
-    LOG_INFO_MSG("CALLBACK", "DEBUG: Created callback JSON with result_file='%s', result_size=%zu", job_id, json_size);
-
-    // Add metadata for quick access
-    if (result && result->metadata) {
-        json_object_object_add(callback, "metadata", json_object_get(result->metadata));
-    }
-
-    const char *callback_json = json_object_to_json_string(callback);
-    size_t callback_json_len = strlen(callback_json);
-
-    LOG_INFO_MSG("CALLBACK", "Sending file-based callback: job=%s, file_size=%zu, callback_size=%zu",
-                 job_id, json_size, callback_json_len);
-    LOG_INFO_MSG("CALLBACK", "DEBUG: Callback JSON payload: %s", callback_json);
-
-    // Ensure job_id and json_size are valid
-    LOG_INFO_MSG("CALLBACK", "DEBUG: Values - job_id='%s', json_size=%zu", job_id, json_size);
-
-    // Send minimal HTTP callback (should be <1KB vs 11MB+)
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        LOG_ERROR_MSG("CALLBACK", "Failed to initialize CURL");
-        json_object_put(full_result);
-        json_object_put(callback);
-        return;
-    }
-
-    curl_easy_setopt(curl, CURLOPT_URL, callback_url);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, callback_json);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)callback_json_len);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, get_callback_timeout_safe()); // Configurable timeout for airag processing
-
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    CURLcode res = curl_easy_perform(curl);
-    long response_code = 0;
-    (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-
-    if (res != CURLE_OK) {
-        LOG_ERROR_MSG("CALLBACK", "File-based callback failed: %s", curl_easy_strerror(res));
-    } else {
-        LOG_INFO_MSG("CALLBACK", "File-based callback sent successfully: job=%s, HTTP %ld",
-                     job_id, response_code);
-    }
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    json_object_put(full_result);
-    json_object_put(callback);
-}

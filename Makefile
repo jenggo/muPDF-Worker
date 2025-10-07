@@ -9,11 +9,11 @@ SRCDIR=.
 BUILDDIR=build
 
 # Source files
-SOURCES=main.c extraction.c redis_queue.c monitoring.c
+SOURCES=main.c extraction.c redis_queue.c monitoring.c ws_client.c
 OBJECTS=$(SOURCES:%.c=$(BUILDDIR)/%.o)
 
 # Required libraries
-LIBS=-lmupdf -lmupdf-third -ljson-c -lcurl -lpthread -lm -lhiredis
+LIBS=-lmupdf -lmupdf-third -ljson-c -lcurl -lpthread -lm -lhiredis -lwslay
 
 # Package config for library paths
 MUPDF_CFLAGS=$(shell pkg-config --cflags mupdf 2>/dev/null || echo "-I/usr/local/include -I/usr/local/include/mupdf")
