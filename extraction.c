@@ -222,12 +222,21 @@ json_object* extract_images_filtered(fz_context *ctx, fz_document *doc, const ch
 static json_object* extract_text_blocks_from_page(fz_context *ctx __attribute__((unused)), fz_stext_page *stext_page, int page_num) {
     json_object *blocks_array = json_object_new_array();
 
-    for (fz_stext_block *block = stext_page->first_block; block; block = block->next) {
-        if (block->type != FZ_STEXT_BLOCK_TEXT) {
-            continue;
-        }
+    // Defensive: if stext_page is NULL, return empty array
+    if (!stext_page) {
+        return blocks_array;
+    }
 
-        json_object *block_obj = json_object_new_object();
+    /* Protect iteration over stext_page blocks with fz_try so that any internal
+       MuPDF errors raised while iterating do not abort the whole process.
+       Also guard against missing line/char pointers. */
+    fz_try(ctx) {
+        for (fz_stext_block *block = stext_page->first_block; block; block = block->next) {
+            if (block->type != FZ_STEXT_BLOCK_TEXT || !block->u.t.first_line) {
+                continue;
+            }
+
+            json_object *block_obj = json_object_new_object();
         json_object *lines_array = json_object_new_array();
 
         // Add block metadata
@@ -291,11 +300,18 @@ static json_object* extract_text_blocks_from_page(fz_context *ctx __attribute__(
             free(line_text);
         }
 
-        json_object_object_add(block_obj, "lines", lines_array);
-        json_object_object_add(block_obj, "text", json_object_new_string(block_text));
-        json_object_array_add(blocks_array, block_obj);
+            json_object_object_add(block_obj, "lines", lines_array);
+            json_object_object_add(block_obj, "text", json_object_new_string(block_text));
+            json_object_array_add(blocks_array, block_obj);
 
-        free(block_text);
+            free(block_text);
+        }
+    }
+    fz_always(ctx) {
+        // No local resources to drop here; caller owns the page/stext_page
+    }
+    fz_catch(ctx) {
+        (void)fprintf(stderr, "Error extracting text blocks on page %d\n", page_num);
     }
 
     return blocks_array;
@@ -307,12 +323,21 @@ static json_object* extract_text_blocks_from_page(fz_context *ctx __attribute__(
 static json_object* extract_paragraphs_from_page(fz_context *ctx __attribute__((unused)), fz_stext_page *stext_page, int page_num) {
     json_object *paragraphs_array = json_object_new_array();
 
-    for (fz_stext_block *block = stext_page->first_block; block; block = block->next) {
-        if (block->type != FZ_STEXT_BLOCK_TEXT) {
-            continue;
-        }
+    // Defensive: if stext_page is NULL, nothing to parse
+    if (!stext_page) {
+        return paragraphs_array;
+    }
 
-        // Current paragraph data
+    /* Use fz_try to isolate page-level extraction errors and skip problematic
+       blocks instead of crashing the worker. Also ensure block->u.t.first_line
+       exists before iterating. */
+    fz_try(ctx) {
+        for (fz_stext_block *block = stext_page->first_block; block; block = block->next) {
+            if (block->type != FZ_STEXT_BLOCK_TEXT || !block->u.t.first_line) {
+                continue;
+            }
+
+            // Current paragraph data
         json_object *current_para = NULL;
         json_object *para_lines = NULL;
         char *para_text = NULL;
@@ -389,18 +414,25 @@ static json_object* extract_paragraphs_from_page(fz_context *ctx __attribute__((
             free(line_text);
         }
 
-        // Finish final paragraph
-        if (current_para) {
-            json_object_object_add(current_para, "lines", para_lines);
-            json_object_object_add(current_para, "text", json_object_new_string(para_text ? para_text : ""));
-            json_object_object_add(current_para, "bbox", create_bounding_box_json(para_bbox));
-            json_object_object_add(current_para, "line_count", json_object_new_int(para_line_count));
-            json_object_array_add(paragraphs_array, current_para);
+            // Finish final paragraph
+            if (current_para) {
+                json_object_object_add(current_para, "lines", para_lines);
+                json_object_object_add(current_para, "text", json_object_new_string(para_text ? para_text : ""));
+                json_object_object_add(current_para, "bbox", create_bounding_box_json(para_bbox));
+                json_object_object_add(current_para, "line_count", json_object_new_int(para_line_count));
+                json_object_array_add(paragraphs_array, current_para);
 
-            if (para_text) {
-                free(para_text);
+                if (para_text) {
+                    free(para_text);
+                }
             }
         }
+    }
+    fz_always(ctx) {
+        // No local resources to drop here; caller is responsible for stext_page
+    }
+    fz_catch(ctx) {
+        (void)fprintf(stderr, "Error extracting paragraphs on page %d\n", page_num);
     }
 
     return paragraphs_array;
@@ -420,119 +452,136 @@ static json_object* extract_images_from_page_filtered(fz_context *ctx, fz_page *
 
         stext_page = fz_new_stext_page_from_page(ctx, page, &opts);
 
-        int image_id = 0;
-        for (fz_stext_block *block = stext_page->first_block; block; block = block->next) {
-            if (block->type != FZ_STEXT_BLOCK_IMAGE) {
-                continue;
-            }
-
-            json_object *image_obj = json_object_new_object();
-
-            // Image metadata
-            json_object_object_add(image_obj, "page", json_object_new_int(page_num));
-            json_object_object_add(image_obj, "image_id", json_object_new_int(image_id++));
-            json_object_object_add(image_obj, "type", json_object_new_string("image"));
-            json_object_object_add(image_obj, "bbox", create_bounding_box_json(block->bbox));
-
-            // Transform matrix
-            json_object *transform_obj = json_object_new_object();
-            json_object_object_add(transform_obj, "a", json_object_new_double(block->u.i.transform.a));
-            json_object_object_add(transform_obj, "b", json_object_new_double(block->u.i.transform.b));
-            json_object_object_add(transform_obj, "c", json_object_new_double(block->u.i.transform.c));
-            json_object_object_add(transform_obj, "d", json_object_new_double(block->u.i.transform.d));
-            json_object_object_add(transform_obj, "e", json_object_new_double(block->u.i.transform.e));
-            json_object_object_add(transform_obj, "f", json_object_new_double(block->u.i.transform.f));
-            json_object_object_add(image_obj, "transform", transform_obj);
-
-            // Image properties
-            if (block->u.i.image) {
-                fz_image *img = block->u.i.image;
-
-                // Debug: Log all images found for analysis
-                printf("[IMAGE_DEBUG] Found image on page %d: %dx%d, bpc=%d, n=%d, bbox=%.1f,%.1f,%.1f,%.1f\n",
-                       page_num, img->w, img->h, img->bpc, img->n,
-                       block->bbox.x0, block->bbox.y0, block->bbox.x1, block->bbox.y1);
-
-                // Apply intelligent filtering to remove gradients, patterns, and decorative elements
-                if (!is_meaningful_image(ctx, img, block->bbox, no_filter)) {
-                    printf("[IMAGE_DEBUG] Image filtered out as non-meaningful\n");
-                    json_object_put(image_obj); // Free the unused object
-                    image_id--; // Don't increment ID for filtered images
+        // If stext_page creation failed, skip image extraction for this page
+        if (!stext_page) {
+            printf("[IMAGE_DEBUG] stext_page NULL on page %d, skipping image extraction\n", page_num);
+        } else {
+            int image_id = 0;
+            /* Iterate blocks defensively: ensure block is valid and only access
+               block->u.i.* when block->type is IMAGE and block->u.i.image is non-NULL.
+               Wrap per-block processing in a small fz_try to prevent a single bad
+               block from aborting the entire page. */
+            for (fz_stext_block *block = stext_page->first_block; block; block = block->next) {
+                if (block->type != FZ_STEXT_BLOCK_IMAGE) {
                     continue;
                 }
-                printf("[IMAGE_DEBUG] Image passed filters, including in results\n");
-
-                json_object_object_add(image_obj, "width", json_object_new_int(img->w));
-                json_object_object_add(image_obj, "height", json_object_new_int(img->h));
-                json_object_object_add(image_obj, "bpc", json_object_new_int(img->bpc));
-                json_object_object_add(image_obj, "n", json_object_new_int(img->n));
-
-                // Extract and save image to shared volume
-                const char *format = "png"; // Always save as PNG for consistency
-                char image_path[512] = {0};
 
                 fz_try(ctx) {
-                    // Convert image to pixmap for resizing support
-                    fz_pixmap *pix = fz_get_pixmap_from_image(ctx, img, NULL, NULL, NULL, NULL);
-                    if (pix) {
-                        // Resize if needed to stay under 20MB (for OCR compatibility)
-                        resize_result_t resize_result = resize_image_to_limit(ctx, pix, 20 * 1024 * 1024);
-
-                        if (resize_result.buffer && resize_result.ocr_compatible) {
-                            // Image successfully resized and is OCR-compatible
-                            unsigned char *data = NULL;
-                            size_t len = fz_buffer_storage(ctx, resize_result.buffer, &data);
-
-                            // Create organizational directory if it doesn't exist
-                            char org_dir[256];
-                            get_org_images_path(org_dir, sizeof(org_dir), image_directory_path);
-
-                            // Generate organizational filename: org_id/documentID_page_imageId_timestamp.png
-                            (void)snprintf(image_path, sizeof(image_path),
-                                    "%s/page_%d_img_%d_%ld.png",
-                                    org_dir, page_num, image_id, (long)time(NULL));
-
-                            // Save image data to file
-                            FILE *img_file = fopen(image_path, "wb");
-                            if (img_file) {
-                                (void)fwrite(data, 1, len, img_file);
-                                (void)fclose(img_file);
-                                printf("[IMAGE_DEBUG] Saved OCR-compatible image: %s (%zu bytes, %dx%d)\n",
-                                       image_path, len, resize_result.width, resize_result.height);
-
-                                // Add OCR compatibility flag to JSON
-                                json_object_object_add(image_obj, "ocr_compatible", json_object_new_boolean(1));
-                            } else {
-                                printf("[IMAGE_DEBUG] Failed to save image: %s\n", image_path);
-                                image_path[0] = '\0'; // Clear path on failure
-                            }
-
-                            fz_drop_buffer(ctx, resize_result.buffer);
-                        } else {
-                            // Image exceeds OCR limit - skip OCR but still record metadata
-                            printf("[IMAGE_DEBUG] Skipping OCR for oversized image (page %d, img %d): %dx%d\n",
-                                   page_num, image_id, img->w, img->h);
-                            json_object_object_add(image_obj, "ocr_compatible", json_object_new_boolean(0));
-                            json_object_object_add(image_obj, "skip_reason", json_object_new_string("exceeds_20mb_limit"));
-                        }
-                        fz_drop_pixmap(ctx, pix);
+                    if (!block->u.i.image) {
+                        // Nothing to do for this image block
+                        continue;
                     }
+
+                    json_object *image_obj = json_object_new_object();
+
+                    // Image metadata
+                    json_object_object_add(image_obj, "page", json_object_new_int(page_num));
+                    json_object_object_add(image_obj, "image_id", json_object_new_int(image_id++));
+                    json_object_object_add(image_obj, "type", json_object_new_string("image"));
+                    json_object_object_add(image_obj, "bbox", create_bounding_box_json(block->bbox));
+
+                    // Transform matrix - safe to read even if some fields are zeroed
+                    json_object *transform_obj = json_object_new_object();
+                    json_object_object_add(transform_obj, "a", json_object_new_double(block->u.i.transform.a));
+                    json_object_object_add(transform_obj, "b", json_object_new_double(block->u.i.transform.b));
+                    json_object_object_add(transform_obj, "c", json_object_new_double(block->u.i.transform.c));
+                    json_object_object_add(transform_obj, "d", json_object_new_double(block->u.i.transform.d));
+                    json_object_object_add(transform_obj, "e", json_object_new_double(block->u.i.transform.e));
+                    json_object_object_add(transform_obj, "f", json_object_new_double(block->u.i.transform.f));
+                    json_object_object_add(image_obj, "transform", transform_obj);
+
+                    // Image properties
+                    fz_image *img = block->u.i.image;
+                    if (img) {
+                        printf("[IMAGE_DEBUG] Found image on page %d: %dx%d, bpc=%d, n=%d, bbox=%.1f,%.1f,%.1f,%.1f\n",
+                               page_num, img->w, img->h, img->bpc, img->n,
+                               block->bbox.x0, block->bbox.y0, block->bbox.x1, block->bbox.y1);
+
+                        if (!is_meaningful_image(ctx, img, block->bbox, no_filter)) {
+                            printf("[IMAGE_DEBUG] Image filtered out as non-meaningful\n");
+                            json_object_put(image_obj);
+                            image_id--;
+                            continue;
+                        }
+                        printf("[IMAGE_DEBUG] Image passed filters, including in results\n");
+
+                        json_object_object_add(image_obj, "width", json_object_new_int(img->w));
+                        json_object_object_add(image_obj, "height", json_object_new_int(img->h));
+                        json_object_object_add(image_obj, "bpc", json_object_new_int(img->bpc));
+                        json_object_object_add(image_obj, "n", json_object_new_int(img->n));
+
+                        // Extract and save image to shared volume
+                        const char *format = "png"; // Always save as PNG for consistency
+                        char image_path[512] = {0};
+                        size_t image_size_bytes = 0;
+
+                        fz_try(ctx) {
+                            fz_buffer *buffer = fz_new_buffer_from_image_as_png(ctx, img, fz_default_color_params);
+                            if (buffer) {
+                                unsigned char *data = NULL;
+                                size_t len = fz_buffer_storage(ctx, buffer, &data);
+                                image_size_bytes = len;
+
+                                // Create organizational directory if it doesn't exist
+                                char org_dir[256];
+                                get_org_images_path(org_dir, sizeof(org_dir), image_directory_path);
+
+                                // Generate organizational filename: org_id/page_imageId_timestamp.png
+                                (void)snprintf(image_path, sizeof(image_path),
+                                        "%s/page_%d_img_%d_%ld.png",
+                                        org_dir, page_num, image_id, (long)time(NULL));
+
+                                // Save image data to file
+                                FILE *img_file = fopen(image_path, "wb");
+                                if (img_file) {
+                                    (void)fwrite(data, 1, len, img_file);
+                                    (void)fclose(img_file);
+                                    printf("[IMAGE_DEBUG] Saved image to: %s (%zu bytes)\n", image_path, len);
+                                } else {
+                                    printf("[IMAGE_DEBUG] Failed to save image: %s\n", image_path);
+                                    image_path[0] = '\0'; // Clear path on failure
+                                }
+
+                                fz_drop_buffer(ctx, buffer);
+                            }
+                        }
+                        fz_catch(ctx) {
+                            printf("[IMAGE_DEBUG] Failed to extract image data\n");
+                            image_path[0] = '\0'; // Clear path on failure
+                        }
+
+                        json_object_object_add(image_obj, "format", json_object_new_string(format));
+
+                        // Add image path if successfully saved
+                        if (image_path[0] != '\0') {
+                            json_object_object_add(image_obj, "image_path", json_object_new_string(image_path));
+                        }
+
+                        // OCR compatibility: Mistral OCR API has 50MB limit
+                        int ocr_compatible = (image_size_bytes > 0 && image_size_bytes <= 50 * 1024 * 1024);
+                        json_object_object_add(image_obj, "ocr_compatible", json_object_new_boolean(ocr_compatible));
+
+                        if (!ocr_compatible && image_size_bytes > 0) {
+                            printf("[IMAGE_DEBUG] Image exceeds Mistral OCR 50MB limit: %.2f MB\n",
+                                   (float)image_size_bytes / (1024.0f * 1024.0f));
+                        }
+                    } else {
+                        printf("[IMAGE_DEBUG] Block reports image but image pointer is NULL (page %d)\n", page_num);
+                        json_object_object_add(image_obj, "width", json_object_new_int(0));
+                        json_object_object_add(image_obj, "height", json_object_new_int(0));
+                        json_object_object_add(image_obj, "bpc", json_object_new_int(0));
+                        json_object_object_add(image_obj, "n", json_object_new_int(0));
+                    }
+
+                    // Add image object to images array
+                    json_object_array_add(images_array, image_obj);
                 }
                 fz_catch(ctx) {
-                    printf("[IMAGE_DEBUG] Failed to extract image data\n");
-                    image_path[0] = '\0'; // Clear path on failure
+                    printf("[IMAGE_DEBUG] Exception processing image block on page %d, skipping block\n", page_num);
+                    continue;
                 }
-
-                json_object_object_add(image_obj, "format", json_object_new_string(format));
-
-                // Add image path if successfully saved
-                if (image_path[0] != '\0') {
-                    json_object_object_add(image_obj, "image_path", json_object_new_string(image_path));
-                }
-            }
-
-            json_object_array_add(images_array, image_obj);
-        }
+            } /* end for blocks */
+        } /* end else stext_page */
     }
     fz_always(ctx) {
         if (stext_page) {
@@ -957,8 +1006,8 @@ static json_object* extract_vector_objects_from_page(fz_context *ctx, fz_page *p
                         "%s/page_%d_%s_%d_%ld.png",
                         org_dir, page_num, object_type, object_id, (long)time(NULL));
 
-                // Resize if needed to stay under 20MB (for OCR compatibility)
-                resize_result_t vec_result = resize_image_to_limit(ctx, pix, 20 * 1024 * 1024);
+                // Resize if needed to stay under 50MB (Mistral OCR API limit)
+                resize_result_t vec_result = resize_image_to_limit(ctx, pix, 50 * 1024 * 1024);
                 int final_width = vec_result.width;
                 int final_height = vec_result.height;
                 int ocr_compatible = vec_result.ocr_compatible;
@@ -999,7 +1048,7 @@ static json_object* extract_vector_objects_from_page(fz_context *ctx, fz_page *p
                     if (image_path[0] != '\0') {
                         json_object_object_add(vector_obj, "image_path", json_object_new_string(image_path));
                     } else {
-                        json_object_object_add(vector_obj, "skip_reason", json_object_new_string("exceeds_20mb_limit"));
+                        json_object_object_add(vector_obj, "skip_reason", json_object_new_string("exceeds_50mb_limit"));
                     }
 
                     json_object_object_add(vector_obj, "content_ratio", json_object_new_double(content_ratio));

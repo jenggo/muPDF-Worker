@@ -138,10 +138,10 @@ RUN --mount=type=cache,target=/src/downloads \
     echo "FZ_ENABLE_BARCODE = 0" >> user.make && \
     # Remove OpenJPEG source files completely
     rm -f source/fitz/encode-jpx.c source/fitz/barcode.cpp && \
-    # Build static MuPDF libraries
+    # Build static MuPDF libraries with NDEBUG to disable assertions
     make generate || true && \
     make -j$(nproc) CC=gcc \
-        CFLAGS="-fPIC -O2 -DTOFU_CJK_EXT=0 -Iinclude" \
+        CFLAGS="-fPIC -O2 -DNDEBUG -DTOFU_CJK_EXT=0 -Iinclude" \
         LDFLAGS="-static" \
         build=release \
         libs && \

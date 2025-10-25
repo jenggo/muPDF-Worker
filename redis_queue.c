@@ -41,9 +41,21 @@ static int tcp_ping(const char *host, int port, int timeout_ms) {
     hints.ai_socktype = SOCK_STREAM;  // TCP
 
     // Resolve hostname (POSIX-compliant, no deprecated functions)
-    if (getaddrinfo(host, port_str, &hints, &result_addr) != 0) {
-        fprintf(stderr, "[Redis TCP] Failed to resolve host: %s\n", host);
+    static int dns_error_count = 0;
+    int dns_result = getaddrinfo(host, port_str, &hints, &result_addr);
+    if (dns_result != 0) {
+        // Only log DNS errors occasionally to avoid log spam
+        dns_error_count++;
+        if (dns_error_count == 1 || dns_error_count % 20 == 0) {
+            fprintf(stderr, "[Redis TCP] DNS resolution failed for %s (attempt #%d, check network/DNS)\n", host, dns_error_count);
+        }
         return -1;
+    }
+
+    // Reset DNS error counter on successful resolution
+    if (dns_error_count > 0) {
+        printf("[Redis TCP] DNS resolution recovered after %d failed attempts\n", dns_error_count);
+        dns_error_count = 0;
     }
 
     // Try each address until we successfully connect
@@ -229,16 +241,27 @@ int redis_connect(redis_consumer_t *consumer) {
     if (!consumer) return -1;
 
     // Step 1: TCP connectivity check (fast pre-flight check)
-    printf("[Redis] Checking TCP connectivity to %s:%d...\n",
-           consumer->config.host, consumer->config.port);
+    // Don't log every attempt to reduce spam during reconnection
+    static int connect_attempts = 0;
+    connect_attempts++;
+
+    if (connect_attempts == 1 || connect_attempts % 10 == 0) {
+        printf("[Redis] Checking TCP connectivity to %s:%d (attempt #%d)...\n",
+               consumer->config.host, consumer->config.port, connect_attempts);
+    }
 
     if (tcp_ping(consumer->config.host, consumer->config.port, 2000) != 0) {
-        fprintf(stderr, "[Redis] TCP connectivity check failed: %s:%d unreachable\n",
-                consumer->config.host, consumer->config.port);
+        // Only log every 10th failure to reduce spam
+        if (connect_attempts == 1 || connect_attempts % 10 == 0) {
+            fprintf(stderr, "[Redis] TCP connectivity check failed: %s:%d unreachable (attempt #%d)\n",
+                    consumer->config.host, consumer->config.port, connect_attempts);
+        }
         return -1;
     }
 
-    printf("[Redis] TCP connectivity OK, establishing Redis connection...\n");
+    // Reset counter on successful connection
+    connect_attempts = 0;
+    printf("[Redis] ✓ TCP connectivity OK, establishing Redis connection...\n");
 
     // Step 2: Create Redis protocol connection with timeout
     struct timeval timeout = {
@@ -368,15 +391,32 @@ void* redis_consumer_thread(void *arg) {
             
             if (need_reconnect) {
                 printf("[Redis] Connection lost, attempting to reconnect...\n");
+                fflush(stdout);
                 redis_disconnect(consumer);
 
                 // Keep trying to reconnect indefinitely (with exponential backoff)
                 int reconnect_attempts = 0;
 
+                printf("[Redis] DEBUG: Starting reconnection loop (consumer->running=%d)\n", consumer->running);
+                fflush(stdout);
+
                 while (consumer->running) {
                     reconnect_attempts++;
 
-                    if (redis_connect(consumer) == 0) {
+                    printf("[Redis] DEBUG: Loop iteration %d (consumer->running=%d)\n", reconnect_attempts, consumer->running);
+                    fflush(stdout);
+
+                    // Log progress (reduced frequency to avoid spam)
+                    if (reconnect_attempts == 1 || reconnect_attempts % 5 == 0) {
+                        printf("[Redis] Reconnection attempt #%d...\n", reconnect_attempts);
+                        fflush(stdout);
+                    }
+
+                    int connect_result = redis_connect(consumer);
+                    printf("[Redis] DEBUG: redis_connect() returned %d\n", connect_result);
+                    fflush(stdout);
+
+                    if (connect_result == 0) {
                         printf("[Redis] Reconnection successful after %d attempt(s)\n", reconnect_attempts);
                         consecutive_failures = 0; // Reset failure counter on successful reconnect
 
@@ -400,9 +440,21 @@ void* redis_consumer_thread(void *arg) {
                     int reconnect_backoff = 1 << (reconnect_attempts < 6 ? reconnect_attempts : 6);
                     if (reconnect_backoff > max_backoff) reconnect_backoff = max_backoff;
 
-                    printf("[Redis] Reconnection attempt %d failed, retrying in %d seconds...\n",
-                           reconnect_attempts, reconnect_backoff);
+                    printf("[Redis] Reconnection attempt #%d failed (total attempts: %d), retrying in %d seconds...\n",
+                           reconnect_attempts, reconnect_attempts, reconnect_backoff);
+                    fflush(stdout); // Force output immediately
+
+                    // Log every 10th attempt to show we're still trying
+                    if (reconnect_attempts % 10 == 0) {
+                        printf("[Redis] Still attempting to reconnect after %d tries (check network/DNS)...\n", reconnect_attempts);
+                        fflush(stdout);
+                    }
+
+                    printf("[Redis] DEBUG: About to sleep for %d seconds...\n", reconnect_backoff);
+                    fflush(stdout);
                     sleep(reconnect_backoff);
+                    printf("[Redis] DEBUG: Sleep completed, looping back\n");
+                    fflush(stdout);
                 }
             } else {
                 // Not a connection error, just a processing error
