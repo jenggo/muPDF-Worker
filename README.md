@@ -11,6 +11,7 @@ Standalone C service for high-performance document parsing using MuPDF. Provides
   - Character-level text with precise coordinates
   - Paragraph detection with bounding boxes
   - Embedded image extraction with metadata
+  - Automatic thumbnail generation (150px proportional)
 - **Security Hardened** - CVE-free build with OpenJPEG disabled
 - **Multi-threaded** - Concurrent document processing
 - **Production Ready** - Static binary, scratch container, resource limits
@@ -23,7 +24,19 @@ The worker operates in multiple modes:
 - **Redis Queue Mode** - Pulls jobs from Redis queue for processing
 - **HTTP API Mode** - Legacy REST API for document parsing (POST /parse, GET /health)
 
-Jobs are processed concurrently with configurable limits. Results include text blocks with spatial coordinates, paragraph boundaries, and embedded images.
+Jobs are processed concurrently with configurable limits. Results include text blocks with spatial coordinates, paragraph boundaries, and embedded images with automatic thumbnails.
+
+### Image Extraction and Thumbnails
+
+When the worker extracts images from documents, it automatically generates proportional thumbnails:
+- **Thumbnail size**: 150px on the long edge (maintains aspect ratio)
+- **Naming convention**: `thumb_` prefix added to original filename
+- **Format**: PNG (same as original extracted images)
+- **Location**: Same directory as the full-size image
+
+Example:
+- Full image: `/uploads/images/org_id/page_1_img_0_1234567890.png`
+- Thumbnail: `/uploads/images/org_id/thumb_page_1_img_0_1234567890.png`
 
 ## Quick Start
 

@@ -59,6 +59,7 @@ static json_object* create_quad_json(fz_quad quad);
 static int is_paragraph_break(fz_stext_line *current_line, fz_stext_line *next_line);
 static int is_meaningful_image(fz_context *ctx, fz_image *image, fz_rect bbox, int no_filter);
 static resize_result_t resize_image_to_limit(fz_context *ctx, fz_pixmap *original_pix, size_t max_bytes);
+static int save_thumbnail(fz_context *ctx, fz_image *img, const char *original_path, int target_long_edge);
 
 /*
  * Extract text blocks with character-level coordinates
@@ -537,6 +538,9 @@ static json_object* extract_images_from_page_filtered(fz_context *ctx, fz_page *
                                     (void)fwrite(data, 1, len, img_file);
                                     (void)fclose(img_file);
                                     printf("[IMAGE_DEBUG] Saved image to: %s (%zu bytes)\n", image_path, len);
+                                    
+                                    // Create thumbnail (150px on long edge)
+                                    save_thumbnail(ctx, img, image_path, 150);
                                 } else {
                                     printf("[IMAGE_DEBUG] Failed to save image: %s\n", image_path);
                                     image_path[0] = '\0'; // Clear path on failure
@@ -814,6 +818,107 @@ static resize_result_t resize_image_to_limit(fz_context *ctx, fz_pixmap *origina
     }
 
     return result;
+}
+
+/*
+ * Create a proportional thumbnail of an image
+ * target_long_edge: desired size of the longest edge (150-200px recommended)
+ * Returns: 1 on success, 0 on failure
+ */
+static int save_thumbnail(fz_context *ctx, fz_image *img, const char *original_path, int target_long_edge) {
+    if (!img || !original_path || original_path[0] == '\0') {
+        return 0;
+    }
+
+    fz_pixmap *pix = NULL;
+    fz_pixmap *scaled_pix = NULL;
+    fz_buffer *buffer = NULL;
+    int success = 0;
+
+    fz_var(pix);
+    fz_var(scaled_pix);
+    fz_var(buffer);
+
+    fz_try(ctx) {
+        // Get pixmap from image
+        pix = fz_get_pixmap_from_image(ctx, img, NULL, NULL, NULL, NULL);
+        if (!pix) {
+            printf("[THUMBNAIL] Failed to get pixmap from image\n");
+            fz_throw(ctx, FZ_ERROR_GENERIC, "Failed to get pixmap");
+        }
+
+        // Calculate thumbnail dimensions (proportional to target_long_edge on long edge)
+        int orig_width = pix->w;
+        int orig_height = pix->h;
+        int thumb_width, thumb_height;
+        
+        if (orig_width >= orig_height) {
+            // Width is the long edge
+            thumb_width = target_long_edge;
+            thumb_height = (int)((float)orig_height * target_long_edge / orig_width);
+        } else {
+            // Height is the long edge
+            thumb_height = target_long_edge;
+            thumb_width = (int)((float)orig_width * target_long_edge / orig_height);
+        }
+
+        // Ensure minimum size of 1x1
+        if (thumb_width < 1) thumb_width = 1;
+        if (thumb_height < 1) thumb_height = 1;
+
+        printf("[THUMBNAIL] Creating thumbnail %dx%d from original %dx%d (target long edge: %dpx)\n",
+               thumb_width, thumb_height, orig_width, orig_height, target_long_edge);
+
+        // Scale the pixmap
+        scaled_pix = fz_scale_pixmap(ctx, pix, 0, 0, thumb_width, thumb_height, NULL);
+        
+        // Encode as PNG
+        buffer = fz_new_buffer_from_pixmap_as_png(ctx, scaled_pix, fz_default_color_params);
+        
+        // Generate thumbnail path with thumb_ prefix
+        char thumb_path[512];
+        const char *last_slash = strrchr(original_path, '/');
+        if (last_slash) {
+            // Split path into directory and filename
+            size_t dir_len = last_slash - original_path + 1;
+            snprintf(thumb_path, sizeof(thumb_path), "%.*sthumb_%s", 
+                    (int)dir_len, original_path, last_slash + 1);
+        } else {
+            // No directory, just add prefix
+            snprintf(thumb_path, sizeof(thumb_path), "thumb_%s", original_path);
+        }
+
+        // Save thumbnail
+        unsigned char *data = NULL;
+        size_t len = fz_buffer_storage(ctx, buffer, &data);
+        
+        FILE *thumb_file = fopen(thumb_path, "wb");
+        if (thumb_file) {
+            fwrite(data, 1, len, thumb_file);
+            fclose(thumb_file);
+            printf("[THUMBNAIL] Saved thumbnail to: %s (%zu bytes)\n", thumb_path, len);
+            success = 1;
+        } else {
+            printf("[THUMBNAIL] Failed to save thumbnail: %s\n", thumb_path);
+        }
+    }
+    fz_always(ctx) {
+        if (buffer) {
+            fz_drop_buffer(ctx, buffer);
+        }
+        if (scaled_pix) {
+            fz_drop_pixmap(ctx, scaled_pix);
+        }
+        if (pix) {
+            fz_drop_pixmap(ctx, pix);
+        }
+    }
+    fz_catch(ctx) {
+        printf("[THUMBNAIL] Error creating thumbnail: %s\n", fz_caught_message(ctx));
+        success = 0;
+    }
+
+    return success;
 }
 
 /*
